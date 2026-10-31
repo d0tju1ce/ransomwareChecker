@@ -1,8 +1,5 @@
 # RansomwareChecker v. 1.0.0
 
-> Retro černo-bílá varianta. Aplikace i HTML výstupy (report, postup nápravy) jsou černo-bílé. Aplikace má vlastní mutex,
-> takže může běžet současně s hlavní verzí.
-
 Přenosný (portable) nástroj pro Windows na **rychlou triáž persistence a artefaktů po ransomware útoku**.
 Kontroly pokrývají techniky typické pro ransomware útoky řízené člověkem: initial access, persistence,
 post-exploitation, exfiltraci dat a nasazení ransomwaru.
@@ -15,12 +12,7 @@ post-exploitation, exfiltraci dat a nasazení ransomwaru.
 
 ## Spuštění
 
-### Aplikace (doporučeno)
-
-`RansomwareChecker.exe` je přenosná aplikace postavená jako TurtleRMM, v jednoduchém retro černo-bílém vzhledu
-(černé pozadí, bílý text, hranaté prvky, neproporcionální písmo Consolas; závažnost High je zvýrazněná inverzně). Vyžádá si admin práva, po spuštění zobrazí
-poslední report a hned provede novou kontrolu. Další kontroly se spouštějí jen na vyžádání tlačítkem **Run check again**
-(během běhu se z něj stane **Stop check**).
+### Aplikace
 
 * Hlavička ukazuje stav (spinner během kontroly, červený křížek = High, oranžový vykřičník = Medium, zelená fajfka).
 * Filtry **High / Medium / Low / Info** a fulltextové hledání.
@@ -35,12 +27,9 @@ poslední report a hned provede novou kontrolu. Další kontroly se spouštějí
 * Font Oswald (Google Fonts, řezy Regular a SemiBold) je vložený v exe, licence SIL OFL je v `licenses\Oswald-OFL.txt`.
 
 Exe potřebuje vedle sebe `RansomwareChecker.ps1` a `config\`. Zdroj je ve složce `src\`, sestavení přes `src\build.cmd`
-(používá csc.exe z .NET Frameworku 4.x, nic se neinstaluje). Po sestavení `src\sign.ps1` podepíše exe i `.ps1`
-certifikátem `CN=RansomwareChecker Code Signing` z `Cert:\CurrentUser\My` (pokud existuje). Po každé úpravě `.ps1`
-je potřeba podpis obnovit spuštěním `src\sign.ps1`.
+(používá csc.exe z .NET Frameworku 4.x, nic se neinstaluje).
 
 ### Skript
-
 ```
 Run-RansomwareChecker.bat                      (vyžádá si admin práva, otevře report)
 Run-RansomwareChecker.bat -DaysBack 60 -Quick
