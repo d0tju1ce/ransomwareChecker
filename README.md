@@ -14,7 +14,7 @@ post-exploitation, data exfiltration and ransomware deployment.
 
 ### App
 
-* The header shows the status (a spinner while a check runs, a red cross = High, an orange exclamation mark = Medium, a green tick).
+* The header shows the status (a spinner while a check runs).
 * **High / Medium / Low / Info** filters and full-text search.
 * Click a row to expand it: full details, *Flagged because* (why the finding was flagged), *Why checked*
   (why the check exists), *Remediation* (recommended steps), MITRE technique, category and time.
