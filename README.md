@@ -1,4 +1,4 @@
-# RansomwareChecker v. 1.0.0 (retro)
+# RansomwareChecker v. 1.0.0
 
 > Retro černo-bílá varianta. Aplikace i HTML výstupy (report, postup nápravy) jsou černo-bílé. Aplikace má vlastní mutex,
 > takže může běžet současně s hlavní verzí.
