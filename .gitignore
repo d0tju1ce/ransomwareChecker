@@ -1,0 +1,11 @@
+# Outputs of checks contain data about the analysed computer - never commit them
+Reports/
+Remediation/
+
+# Build leftovers
+*.old.exe
+src/*.pdb
+
+# Private key of the code signing certificate must never be published
+*.pfx
+*.p12

@@ -1,0 +1,3 @@
+# Keep every file byte-for-byte: the Authenticode signatures of RansomwareChecker.ps1 / .exe
+# break if git converts line endings.
+* -text

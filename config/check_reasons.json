@@ -1,0 +1,96 @@
+{
+  "_comment": "Why each check exists. Keys = finding categories written by RansomwareChecker.ps1. Shown in the app when a finding is expanded (WHY CHECKED).",
+  "Persistence: Run keys": {
+    "Why": "Commodity trojans used as ransomware precursors survive reboots by writing their path to the Run key. Bazar Loader uses Software\\Microsoft\\Windows\\CurrentVersion\\Run; in the Emotet case the payload C:\\Users\\CARPC\\AppData\\Local\\Iqnmqm\\jwkgphpq.euz was started by rundll32 from this key. Run keys are among the 'very common persistence mechanisms' that must be removed during eradication."
+  },
+  "Persistence: Winlogon / IFEO / AppInit": {
+    "Why": "Bazar Loader also abuses Winlogon (Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon) so the payload starts at every user logon. Modified Shell/Userinit values, IFEO debuggers (e.g. on sethc.exe) and AppInit_DLLs are further autostart points of the same technique family."
+  },
+  "Persistence: Startup folders": {
+    "Why": "Qakbot - used for initial access by ProLock, Egregor, REvil and Conti affiliates - persists by putting its payload or an LNK file into the Startup folder. Registry run keys / Startup folder are listed as the first common persistence mechanism of ransomware-related malware."
+  },
+  "Persistence: Scheduled tasks": {
+    "Why": "Creating a scheduled task is a very common persistence technique of trojans in human-operated ransomware attacks. Qakbot creates a task with a GUID name that runs its payload from AppData every 6 hours. Tasks are also used to stop processes and start the ransomware during GPO deployment (LockBit)."
+  },
+  "Persistence: Services": {
+    "Why": "Services run with SYSTEM privileges and are abused for execution, privilege escalation and lateral movement. A Cobalt Strike Beacon started via 'jump psexec_psh' creates a new service; PsExec installs PSEXESVC; REvil was deployed by a service running '%COMSPEC% /C start /b powershell \\\\srvdc01\\...\\msedgeupdater.exe'."
+  },
+  "Persistence: WMI subscriptions": {
+    "Why": "Ransomware affiliates abuse WMI to execute code locally and remotely (Cobalt Strike has it built in). Permanent WMI event subscriptions (CommandLine / ActiveScript consumers) give the same code a fileless, reboot-proof autostart. See MITRE T1546.003."
+  },
+  "Persistence: BITS jobs": {
+    "Why": "Ryuk affiliates used Background Intelligent Transfer Service (bitsadmin /transfer) together with WMIC to copy and start the ransomware on remote hosts; Egregor affiliates used BITS to download the payload from an attacker-controlled server and run it via rundll32."
+  },
+  "Persistence: Remote access / exfil software": {
+    "Why": "Affiliates install legitimate remote access tools (TeamViewer, AnyDesk, SupRemo, Atera, Splashtop, ScreenConnect/ConnectWise...) as redundant access that survives the removal of the initial backdoor. Block them at the start of the response and remove them during eradication. MEGAsync and similar clients are used for data exfiltration."
+  },
+  "Live: Suspicious processes": {
+    "Why": "Running processes reveal what is still active: Emotet injected into rundll32.exe loading a file without the .dll extension from a random AppData folder; Conti ran Cobalt Strike via rundll32 C:\\Programdata\\sys64.dll; encoded PowerShell launches SMB Beacons; Rclone was masqueraded as C:\\Windows\\svchost.exe. Isolate the host before cleaning when such a process is found."
+  },
+  "Config: Security settings": {
+    "Why": "Affiliates weaken the configuration to steal credentials and move laterally: Hive set WDigest UseLogonCredential=1 to cache cleartext passwords; rdp.bat enabled RDP (fDenyTSConnections=0), opened the 'Remote Desktop' firewall group and disabled NLA (UserAuthentication=0). Such changes stay after the attack and must be reverted."
+  },
+  "IOC: Registry": {
+    "Why": "Some ransomware families leave unique registry artifacts. REvil (Sodinokibi) creates HKLM\\SOFTWARE\\BlackLivesMatter with hex values; finding it identifies the strain even when the binary is gone."
+  },
+  "Defense evasion: Defender": {
+    "Why": "Ransomware deployment is almost impossible without disabling security products. REvil's Kaseya script ran Set-MpPreference -DisableRealtimeMonitoring $true ...; LockBit's GPO Registry.pol disables Windows Defender features; Egregor used Group Policy and PowerTool. Exclusions let a ransomware sample run undetected."
+  },
+  "Impact: System recovery": {
+    "Why": "Backups are the ransomware operator's worst enemy, so almost every sample deletes Volume Shadow Copies (vssadmin delete shadows /all /quiet, wmic shadowcopy delete) and disables boot recovery (bcdedit recoveryenabled No, bootstatuspolicy ignoreallfailures). Existing shadow copies must be preserved for recovery."
+  },
+  "Persistence: Accounts": {
+    "Why": "Valid and newly created accounts are a quiet way to keep access: with privileged credentials affiliates create additional accounts for redundant access, and legitimate accounts let them stay undetected for a long time. Passwords of compromised accounts must be changed during containment."
+  },
+  "Events: Log cleared": {
+    "Why": "Affiliates remove logs to make investigation harder - e.g. 'wevtutil el | foreach { wevtutil cl $_ }' clears all event logs at once. Even the clearing itself is a good indicator that the host was compromised."
+  },
+  "Events: Service installed (7045)": {
+    "Why": "Event 7045 in the System log is the most common artifact of Cobalt Strike 'jump psexec_psh', PsExec (PSEXESVC) and service-based ransomware deployment. Correlate its time with logons (4624) and network share access (5140) to find the source host."
+  },
+  "Events: Accounts": {
+    "Why": "Security events 4720 (account created) and 4732 (member added to a security-enabled local group) show accounts created or elevated by the attackers for persistence."
+  },
+  "Events: Brute force (4625)": {
+    "Why": "Compromise of a public-facing RDP server is the most common initial access vector (more than 50 % of attacks per Group-IB). A brute-force attack shows as many 4625 events from one source (often tens of thousands) followed by a successful logon."
+  },
+  "Events: RDP logons": {
+    "Why": "Logons of type 10 (4624) and TerminalServices LocalSessionManager events 21/25 show RDP sessions. A logon from an unusual (e.g. foreign) public IP points to initial access; internal RDP logons trace lateral movement and manual ransomware execution (Crylock)."
+  },
+  "Events: Defender": {
+    "Why": "Affiliates use many tools and some of them get detected - antivirus detections (1116/1117) are very good pivot points, e.g. Backdoor:Win64/CobaltStrike in C:\\ProgramData\\64.dll led to the staging folder. Events 5001/5007 show disabled protection or new exclusions."
+  },
+  "Events: PowerShell 4104": {
+    "Why": "PowerShell is used at almost every stage: Emotet's macro launched PowerShell to download the payload from seven URLs, IcedID used encoded commands, ADRecon and AdFind wrappers run as scripts. Script block logging (4104) records the decoded content."
+  },
+  "Events: PowerShell host (400)": {
+    "Why": "The Windows PowerShell log stores the command line (HostApplication) of every PowerShell start - encoded commands, -w hidden, ExecutionPolicy Bypass, or LockBit forcing Invoke-GPUpdate on all computers."
+  },
+  "Events: Task registered (106)": {
+    "Why": "Event 106 of the TaskScheduler/Operational log records the creation of a scheduled task - persistence of Qakbot and similar trojans or a GPO-pushed ransomware task."
+  },
+  "Events: Firewall rule change": {
+    "Why": "rdp.bat used 'netsh advfirewall firewall set rule group=\"Remote Desktop\" new enable=yes'; the Windows Firewall log records the modified Remote Desktop rule with netsh.exe as the modifying application - evidence that the script really ran."
+  },
+  "Execution: Prefetch": {
+    "Why": "Prefetch files prove that a program ran, with run count and timestamps, even after the attackers deleted their tools (they usually do). SK.EXE (SafetyKatz) and .cr_hand.exe (Crylock) were found this way."
+  },
+  "Execution: UserAssist / BAM": {
+    "Why": "UserAssist (NTUSER.DAT, ROT13) records GUI programs started by a user with the last run time - it revealed netscan.exe, NS.exe, Everything.exe and the Crylock executables and the account that ran them. BAM is a similar per-user execution record."
+  },
+  "Execution: PSReadLine history": {
+    "Why": "The PowerShell console history file is commonly overlooked, yet it contained the attackers' exact commands: rundll32 comsvcs.dll MiniDump of LSASS, Rubeus kerberoast and SafetyKatz."
+  },
+  "Exfiltration: tool artifacts": {
+    "Why": "Double extortion requires data theft. Rclone (often renamed, e.g. to svchost.exe) leaves rclone.conf with the MEGA account; MEGAsync.log lists every uploaded file and the account used. This tells you what was stolen."
+  },
+  "Deployment: Group Policy (DC)": {
+    "Why": "LockBit (and BitPaymer, Ryuk, Egregor affiliates) deploy ransomware enterprise-wide from a domain controller by creating a GPO: Services.xml stops services, Files.xml copies the binary from SYSVOL\\scripts, ScheduledTasks.xml kills processes and starts it, Registry.pol disables Defender."
+  },
+  "Files: Staging folders & tools": {
+    "Why": "Affiliates stage their toolset in a few folders (C:\\ProgramData, C:\\Users\\Public, Temp, user Pictures...): GMER, SafetyKatz, Cobalt Strike DLLs, netscan.exe, AdFind with a.bat and its ad_users.txt / ad_computers.txt output, rdp.bat, 7-Zip archives. Once one staging folder is found, check every artifact in it."
+  },
+  "Impact: Ransom notes": {
+    "Why": "Ransom notes (how_to_decrypt.hta, *-read-me.txt, RESTORE-MY-FILES.txt) identify the ransomware family and the first created note marks the start of encryption - the pivot point for the MFT timeline to find the ransomware executable and how it was deployed."
+  }
+}

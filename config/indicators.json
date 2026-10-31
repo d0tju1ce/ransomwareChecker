@@ -1,0 +1,116 @@
+{
+  "_comment": "RansomwareChecker indicator set. Names are matched case-insensitively. *PathPatterns and CommandKeywords are .NET regular expressions applied to lower-cased text.",
+
+  "AttackerTools": [
+    "mimikatz", "mimi.exe", "safetykatz", "sk.exe", "invoke-mimikatz", "pypykatz", "lazagne",
+    "rubeus", "kerberoast", "sharphound", "bloodhound", "adfind", "adrecon",
+    "netscan.exe", "advanced_ip_scanner", "advanced ip scanner", "kportscan", "masscan", "nlbrute", "ns.exe",
+    "gmer", "processhacker", "powertool", "pchunter", "defendercontrol",
+    "rclone", "stealbit", "exmatter", "sidoh",
+    "cobaltstrike", "beacon.exe", "beacon.dll", "artifact.exe",
+    "crackmapexec", "koadic", "poshc2", "empire",
+    "lsass.dmp", "lsass.zip", "ntds.dit"
+  ],
+
+  "DualUseTools": [
+    "psexec", "psexesvc", "paexec", "procdump", "7za.exe", "everything.exe",
+    "winscp", "filezilla", "megasync", "megacmd", "handybackup", "ngrok", "plink", "chisel"
+  ],
+
+  "RemoteAccessTools": [
+    "anydesk", "teamviewer", "screenconnect", "connectwise", "ateraagent", "splashtop",
+    "supremo", "rutserv", "rfusclient", "remote utilities", "ammyy", "tightvnc", "realvnc",
+    "ultravnc", "tvnserver", "winvnc", "radmin", "meshagent", "rustdesk", "netsupport",
+    "client32.exe", "dwagent", "logmein", "zohoassist", "simplehelp", "kaseya", "level.io"
+  ],
+
+  "SystemBinaryNames": [
+    "svchost.exe", "lsass.exe", "csrss.exe", "services.exe", "smss.exe", "winlogon.exe",
+    "wininit.exe", "explorer.exe", "rundll32.exe", "conhost.exe", "taskhostw.exe",
+    "dllhost.exe", "spoolsv.exe", "lsm.exe", "searchindexer.exe", "msedgeupdater.exe"
+  ],
+
+  "SuspiciousPathPatterns": [
+    "\\\\users\\\\public\\\\",
+    "\\\\programdata\\\\[^\\\\]*$",
+    "\\\\perflogs\\\\",
+    "\\\\windows\\\\temp\\\\",
+    "\\\\appdata\\\\local\\\\temp\\\\",
+    "\\\\appdata\\\\roaming\\\\[^\\\\]*$",
+    "\\\\\\$recycle\\.bin\\\\",
+    "\\\\windows\\\\tasks\\\\",
+    "\\\\windows\\\\debug\\\\",
+    "\\\\system volume information\\\\",
+    "\\\\(pictures|music|videos)\\\\",
+    "^[a-z]:\\\\[^\\\\]+\\.(exe|dll|bat|cmd|ps1|vbs|js|hta)$",
+    "^[a-z]:\\\\windows\\\\[^\\\\]+\\.(dll|bat|cmd|ps1|vbs|js|hta)$",
+    "^\\\\\\\\"
+  ],
+
+  "UnusualPathPatterns": [
+    "\\\\appdata\\\\",
+    "\\\\temp\\\\",
+    "\\\\downloads\\\\",
+    "\\\\desktop\\\\"
+  ],
+
+  "AllowedPathPatterns": [
+    "\\\\programdata\\\\microsoft\\\\windows defender\\\\",
+    "\\\\programdata\\\\microsoft\\\\windows defender advanced threat protection\\\\",
+    "\\\\appdata\\\\local\\\\microsoft\\\\(onedrive|teams|windowsapps)\\\\",
+    "\\\\users\\\\public\\\\desktop\\\\[^\\\\]+\\.lnk$"
+  ],
+
+  "CommandKeywords": [
+    "comsvcs(\\.dll)?[\"',\\s]+#?\\s*minidump",
+    "sekurlsa::",
+    "lsass\\.(dmp|zip)",
+    "procdump.*lsass",
+    "kerberoast",
+    "invoke-mimikatz",
+    "ntdsutil.*ifm",
+    "reg(\\.exe)?\\s+save\\s+hklm\\\\(sam|system|security)",
+    "vssadmin(\\.exe)?\\s+(delete|resize)\\s+shadow",
+    "shadowcopy\\s+delete",
+    "wbadmin(\\.exe)?\\s+delete",
+    "bcdedit.*(recoveryenabled\\s+no|ignoreallfailures)",
+    "wevtutil(\\.exe)?\\s+cl\\b",
+    "clear-eventlog",
+    "set-mppreference.*disable",
+    "add-mppreference.*exclusion",
+    "disablerealtimemonitoring",
+    "uselogoncredential",
+    "fdenytsconnections",
+    "remote desktop\"?\\s+new\\s+enable=yes",
+    "adfind",
+    "get-adcomputer.*export-csv",
+    "net1?(\\.exe)?\\s+user\\s+\\S+\\s+\\S+\\s+/add",
+    "net1?(\\.exe)?\\s+localgroup\\s+(administrators|administr)",
+    "net1?(\\.exe)?\\s+use\\s+\\\\\\\\.*\\$",
+    "icacls.*everyone:f",
+    "invoke-gpupdate",
+    "psexec",
+    "rclone",
+    "mega\\.nz",
+    "dropmefiles",
+    "downloadstring|downloadfile|frombase64string",
+    "-enc(odedcommand)?\\s+[a-z0-9+/=]{20,}",
+    "bitsadmin.*/transfer",
+    "certutil.*(-decode|-urlcache)"
+  ],
+
+  "RansomNotePatterns": [
+    "*how_to_decrypt*", "*how-to-decrypt*", "*how_to_restore*", "*how_to_back_files*",
+    "*restore-my-files*", "*restore_my_files*", "*restore_files*", "*decrypt_instruction*",
+    "*decryption_instructions*", "*help_decrypt*", "*-read-me*", "*_read_me*", "*readme_to_decrypt*",
+    "*recovery_instructions*", "*files_encrypted*", "*ransom*", "*readme-warning*",
+    "*!!!_read*", "*#decrypt*", "*_decrypt_*"
+  ],
+
+  "RegistryIocKeys": [
+    "HKEY_LOCAL_MACHINE\\SOFTWARE\\BlackLivesMatter",
+    "HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\BlackLivesMatter"
+  ],
+
+  "BruteForceThreshold": 20
+}

@@ -1,0 +1,247 @@
+{
+  "_comment": "Recommended remediation per finding category (keys = categories written by RansomwareChecker.ps1). Used for Remediation\\<PC>_<time>\remediation.html/.md and in the app detail. Order: preserve evidence, containment, eradication, recovery, post-incident. <item> in a step is replaced by the finding item. Always validate a finding and preserve evidence before removing anything.",
+  "_General": {
+    "Evidence": [
+      "Preserve evidence BEFORE cleaning: memory dump (FTK Imager / Magnet RAM Capture) and a triage collection (KAPE targets: EventLogs, RegistryHives, Prefetch, $MFT, Amcache, SRUM) to an external drive or network share - never to the analysed disk.",
+      "Copy the Reports folder of this check with the evidence; note who did what and when.",
+      "Do not delete existing volume shadow copies - they may be the only local recovery point."
+    ],
+    "Containment": [
+      "If High findings show an active intrusion: isolate the host from the network (EDR isolation or unplug), if business allows.",
+      "Block command and control addresses found in the findings on the firewall/proxy; consider isolating the whole network from the internet when the attackers were inside for a long time.",
+      "Block remote access tools (AnyDesk, TeamViewer, ScreenConnect, Atera, Splashtop, SupRemo...) and cloud file-sharing services (MEGA, DropMeFiles, MediaFire) at the perimeter.",
+      "Reset passwords of every account that was used or could be compromised (local admins, domain admins, service accounts); reset KRBTGT twice when a domain controller was involved."
+    ],
+    "Recovery": [
+      "If you are not 100 % sure the host is clean, reimage it instead of cleaning it.",
+      "Restore data only from backups verified to be clean and taken before the first malicious activity.",
+      "Run RansomwareChecker again after remediation and compare the reports."
+    ],
+    "PostIncident": [
+      "Remove the root cause: no RDP exposed to the internet, MFA for RDP/VPN and all remote access.",
+      "Patch public-facing systems (VPN, Exchange, Citrix, firewalls) - especially vulnerabilities giving credentials or remote code execution.",
+      "Backups: 3-2-1 rule, separate accounts and MFA for backup servers, offline/immutable copy.",
+      "Logging: longer retention of Security/System/PowerShell logs, PowerShell script block logging, central SIEM, EDR/XDR with isolation capability.",
+      "Phishing as root cause: user training, mail sandboxing of attachments and links."
+    ]
+  },
+  "Persistence: Run keys": {
+    "Steps": [
+      "Verify the value: who created it, does the target file exist, is it signed (Get-AuthenticodeSignature)?",
+      "Collect the target file (hash it, keep a copy in a password protected archive) before removal.",
+      "Remove the malicious value: Remove-ItemProperty -Path '<key>' -Name '<value>' (HKLM for all users, HKU\\<SID> for one user).",
+      "Delete the payload and its folder (e.g. random folder in AppData\\Local used by Emotet) and look for the same file name on other hosts."
+    ]
+  },
+  "Persistence: Winlogon / IFEO / AppInit": {
+    "Steps": [
+      "Restore defaults: Winlogon Shell = explorer.exe, Userinit = C:\\Windows\\system32\\userinit.exe,",
+      "Remove the Debugger value from Image File Execution Options\\<exe> (sticky keys / utilman backdoor).",
+      "Clear AppInit_DLLs and set LoadAppInit_DLLs = 0; delete the referenced DLL after collecting it.",
+      "Treat the host as fully compromised - these changes require administrator rights."
+    ]
+  },
+  "Persistence: Startup folders": {
+    "Steps": [
+      "Check the LNK target / script content of <item>; collect it.",
+      "Delete the file from the Startup folder and the payload it points to (Qakbot uses LNK files).",
+      "Search other user profiles and hosts for the same file name."
+    ]
+  },
+  "Persistence: Scheduled tasks": {
+    "Steps": [
+      "Export the task for evidence: schtasks /query /tn \"<item>\" /xml > task.xml",
+      "Disable and delete it: schtasks /change /tn \"<item>\" /disable ; schtasks /delete /tn \"<item>\" /f",
+      "Delete the executed payload; GUID-named tasks running from AppData every few hours are typical for Qakbot.",
+      "On a domain, check whether the task was pushed by a GPO (ScheduledTasks.xml in SYSVOL) - remove it there, otherwise it comes back."
+    ]
+  },
+  "Persistence: Services": {
+    "Steps": [
+      "Stop and disable the service: sc.exe stop <name> ; sc.exe config <name> start= disabled",
+      "Collect the binary/command line, then delete the service: sc.exe delete <name>",
+      "Services running cmd/powershell (Cobalt Strike psexec_psh) or PSEXESVC indicate lateral movement - find the source host via logons 4624 / share access 5140 at the same time.",
+      "Legitimate vendor services in unusual locations: verify with the vendor before removal."
+    ]
+  },
+  "Persistence: WMI subscriptions": {
+    "Steps": [
+      "Export filter, consumer and binding (Get-CimInstance -Namespace root\\subscription ...) for evidence.",
+      "Remove all three objects: Get-CimInstance -Namespace root\\subscription -ClassName __FilterToConsumerBinding | Where-Object { $_.Consumer.Name -eq '<name>' } | Remove-CimInstance ; then the __EventFilter and the consumer.",
+      "Search other hosts - WMI persistence is fileless and often deployed widely."
+    ]
+  },
+  "Persistence: BITS jobs": {
+    "Steps": [
+      "Inspect the job (bitsadmin /list /allusers /verbose); collect the downloaded file.",
+      "Remove it: Get-BitsTransfer -AllUsers | Where-Object DisplayName -eq '<name>' | Remove-BitsTransfer",
+      "Block the source URL; Ryuk/Egregor used BITS to fetch the ransomware."
+    ]
+  },
+  "Persistence: Remote access / exfil software": {
+    "Steps": [
+      "Confirm with IT whether the tool is approved. If not, treat it as an attacker backdoor.",
+      "Collect its logs first (e.g. AnyDesk ad.trace / connection_trace.txt, TeamViewer Connections_incoming.txt) - they contain attacker IDs and IPs.",
+      "Uninstall it, remove its service and leftover folders, and block the product at the perimeter.",
+      "Exfiltration clients (MEGAsync, WinSCP, FileZilla): review logs to determine what data left the network."
+    ]
+  },
+  "Live: Suspicious processes": {
+    "Steps": [
+      "Before killing: dump the process memory (procdump -ma <PID>) and note its network connections - keeps evidence of fileless malware.",
+      "Isolate the host if the process communicates with external addresses; block those addresses.",
+      "Terminate the process (Stop-Process -Id <PID>), then remove its persistence (Run key, task, service) - otherwise it restarts.",
+      "Masqueraded binaries (svchost.exe outside System32) are attacker tools - collect and delete them."
+    ]
+  },
+  "Config: Security settings": {
+    "Steps": [
+      "WDigest: Set-ItemProperty HKLM:\\SYSTEM\\CurrentControlSet\\Control\\SecurityProviders\\WDigest -Name UseLogonCredential -Value 0 ; then reset passwords of everyone who logged on (cleartext was in memory).",
+      "RDP: disable it where not needed (fDenyTSConnections = 1), otherwise enable NLA (UserAuthentication = 1) and restrict the firewall rule to admin networks.",
+      "Remove netsh portproxy entries (netsh interface portproxy delete ...) and re-enable firewall profiles.",
+      "LocalAccountTokenFilterPolicy = 0; deploy LAPS so local admin passwords differ per host."
+    ]
+  },
+  "IOC: Registry": {
+    "Steps": [
+      "Export the key for evidence (reg export), then delete it.",
+      "The artifact identifies the ransomware family (REvil) - use threat intelligence on this family to look for its typical TTPs elsewhere."
+    ]
+  },
+  "Defense evasion: Defender": {
+    "Steps": [
+      "Remove unauthorized exclusions: Remove-MpPreference -ExclusionPath '<path>' (and -ExclusionProcess / -ExclusionExtension).",
+      "Re-enable protection: Set-MpPreference -DisableRealtimeMonitoring $false -DisableIOAVProtection $false -DisableScriptScanning $false; turn on Tamper Protection.",
+      "If a GPO disabled Defender (Registry.pol), fix the GPO in SYSVOL - otherwise it is reapplied.",
+      "Run a full scan after re-enabling; review the files that were inside the excluded paths."
+    ]
+  },
+  "Impact: System recovery": {
+    "Steps": [
+      "Re-enable recovery: bcdedit /set {default} recoveryenabled Yes ; bcdedit /set {default} bootstatuspolicy displayallfailures",
+      "Set the VSS service back to Manual and recreate shadow copies / System Protection once the host is clean.",
+      "Missing shadow copies on servers that normally have them = deleted by ransomware (vssadmin delete shadows) - restore from offline backups."
+    ]
+  },
+  "Persistence: Accounts": {
+    "Steps": [
+      "Verify every member of the local Administrators group and every recently changed account with its owner.",
+      "Disable unknown accounts (Disable-LocalUser), do not delete them before the investigation ends.",
+      "Reset passwords of compromised accounts; disable the Guest account."
+    ]
+  },
+  "Events: Log cleared": {
+    "Steps": [
+      "Log clearing means deliberate anti-forensics - assume compromise of the account that cleared it.",
+      "Recover events from other sources: SIEM / forwarded logs, EDR telemetry, logs of neighbouring hosts and the domain controller.",
+      "Forward logs to a central collector so they cannot be wiped locally."
+    ]
+  },
+  "Events: Service installed (7045)": {
+    "Steps": [
+      "Correlate each new service with 4624/5140 events at the same time to find the source host and account.",
+      "Check whether the service still exists (see Persistence: Services) and remove it.",
+      "Investigate the source host as well - it is the next step back in the attack."
+    ]
+  },
+  "Events: Accounts": {
+    "Steps": [
+      "Confirm the account creation / group change with the responsible admin.",
+      "Disable accounts created by the attackers and remove them from privileged groups; reset the password of the account that made the change."
+    ]
+  },
+  "Events: Brute force (4625)": {
+    "Steps": [
+      "Block the source IP(s) and remove internet exposure of RDP - use VPN with MFA or an RD Gateway.",
+      "Check for a successful logon (4624 type 10) from the same source after the failures; if present, treat as initial access.",
+      "Rename / disable common account names (Administrator) and enforce an account lockout policy."
+    ]
+  },
+  "Events: RDP logons": {
+    "Steps": [
+      "Logon from a public / foreign IP: treat as compromise - reset the account password, block the IP, check what was done in that session.",
+      "Internal RDP logons at unusual times: trace the chain of hosts (lateral movement) and check each of them."
+    ]
+  },
+  "Events: Defender": {
+    "Steps": [
+      "Use the detection as a pivot: check the folder of the detected file for other attacker tools and the time window around the detection.",
+      "Verify the file was really removed/quarantined; a detection in ProgramData, Public or Temp usually means hands-on-keyboard activity.",
+      "Events 5001/5007: find out who disabled protection or added exclusions and revert it (see Defense evasion: Defender)."
+    ]
+  },
+  "Events: PowerShell 4104": {
+    "Steps": [
+      "Read the full script block (Event Viewer, PowerShell/Operational, event 4104 at the given time); decode Base64 parts.",
+      "Extract URLs, IPs and file names from the script, block them and search the file system for downloaded payloads.",
+      "If it belongs to a legitimate management tool, document it as a known false positive."
+    ]
+  },
+  "Events: PowerShell host (400)": {
+    "Steps": [
+      "Decode -EncodedCommand values and identify the parent process that started PowerShell.",
+      "Block the observed download locations; enable script block logging (4104) if it is off.",
+      "Legitimate automation (RMM, management agents) producing this pattern should be documented as a known false positive."
+    ]
+  },
+  "Events: Task registered (106)": {
+    "Steps": [
+      "Check whether the task still exists (schtasks /query /tn \"<item>\" /v) and what it runs; remove it if malicious (see Persistence: Scheduled tasks)."
+    ]
+  },
+  "Events: Firewall rule change": {
+    "Steps": [
+      "Revert firewall rules changed by netsh/powershell outside of change management (Remote Desktop group enabled by rdp.bat).",
+      "Find the script that made the change (staging folders, PowerShell history) and the account that ran it."
+    ]
+  },
+  "Execution: Prefetch": {
+    "Steps": [
+      "Parse the prefetch file (PECmd) to get all run times and the files/folders it referenced - it shows where the tool was and what it touched.",
+      "Search for the binary and its outputs (dumps, txt lists) on this and other hosts; the tool itself is often already deleted.",
+      "Credential tools (SafetyKatz, Mimikatz, Rubeus) executed = reset all credentials that could have been in memory on this host."
+    ]
+  },
+  "Execution: UserAssist / BAM": {
+    "Steps": [
+      "The entry tells which user account ran the program and when - review that account's activity and reset its password if the program is an attacker tool.",
+      "Locate the executable (or confirm it was deleted) and collect it."
+    ]
+  },
+  "Execution: PSReadLine history": {
+    "Steps": [
+      "Copy the whole ConsoleHost_history.txt as evidence - it contains the attackers' exact commands.",
+      "Follow each command: dumps created (lsass.dmp), hashes extracted (hashes.txt), tools started - clean them up and reset affected credentials (kerberoasted service accounts!)."
+    ]
+  },
+  "Exfiltration: tool artifacts": {
+    "Steps": [
+      "Preserve rclone.conf / MEGAsync logs - they identify the attacker's cloud account and the exact files that were uploaded.",
+      "Report the account to the provider (MEGA abuse) and involve legal/DPO: stolen personal data may require breach notification.",
+      "Remove the tools and block the cloud storage domains."
+    ]
+  },
+  "Deployment: Group Policy (DC)": {
+    "Steps": [
+      "Identify the malicious GPO (GUID folder in SYSVOL\\Policies), back it up for evidence (Backup-GPO), then unlink and delete it.",
+      "Delete binaries from SYSVOL\\scripts and check every client for the copied file and the scheduled task.",
+      "The domain is fully compromised: reset KRBTGT twice, all admin and service account passwords, and review all GPOs and admin group memberships."
+    ]
+  },
+  "Files: Staging folders & tools": {
+    "Steps": [
+      "Collect the files (hash + archived copy) before deleting; the SHA256 in the report can be checked on VirusTotal (never upload a ransomware sample with victim data).",
+      "Review the whole staging folder - one tool usually means more (AdFind outputs, a.bat, rdp.bat, netscan, dumps).",
+      "Delete attacker tools and their outputs; reset credentials if dumps (lsass.dmp, ntds.dit) or hash lists were found.",
+      "Admin scripts of your own that only look suspicious: document them as known."
+    ]
+  },
+  "Impact: Ransom notes": {
+    "Steps": [
+      "Do not delete the notes yet - they identify the ransomware family and contact details; photograph/copy one.",
+      "Use the earliest note time as the pivot for the MFT timeline (MFTECmd) to find the ransomware binary and how it was deployed.",
+      "Check No More Ransom (nomoreransom.org) for a free decryptor; payment decisions belong to management/legal - decryptors may be broken.",
+      "Rebuild affected hosts from clean images and restore data from verified backups."
+    ]
+  }
+}

@@ -1,0 +1,1467 @@
+// RansomwareChecker - portable WinForms front-end for RansomwareChecker.ps1 (built like TurtleRMM, terminal look:
+// retro black & white, monospace font).
+// On start it shows the last report and runs a new check; further checks run only on request ("Run check again").
+// The script does the work and writes Reports\<PC>_<time>\findings.json; the app reads it and shows the findings
+// as expandable rows (details, why it was flagged, why the check exists from config\check_reasons.json, remediation,
+// MITRE technique, time), filterable by severity and text.
+// Settings: RansomwareChecker.ini next to the exe (DaysBack, Quick, RunOnStart).
+// Written for C# 5 (csc.exe shipped with .NET Framework 4.x), see build.cmd.
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Text;
+using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Web.Script.Serialization;
+using System.Windows.Forms;
+
+[assembly: AssemblyTitle("RansomwareChecker")]
+[assembly: AssemblyProduct("RansomwareChecker")]
+[assembly: AssemblyVersion("1.0.0.0")]
+
+namespace RansomwareChecker
+{
+    static class App
+    {
+        public const string Name = "RansomwareChecker";
+        public const string Version = "1.0.0";
+        public static readonly Color Accent = Color.FromArgb(210, 210, 210);     // retro off-white (softer contrast)
+        public static readonly Color AccentHover = Color.FromArgb(185, 185, 185);
+        public static readonly Color AccentDown = Color.FromArgb(150, 150, 150);
+    }
+
+    // Retro black & white palette: black background, white text, greys for hierarchy.
+    // Severity is shown by contrast only: High = inverted (black on white), Medium = white on grey, Low/Info = greys.
+    static class Theme
+    {
+        public static Color Back { get { return Color.FromArgb(0, 0, 0); } }
+        public static Color Card { get { return Color.FromArgb(0, 0, 0); } }
+        public static Color Border { get { return Color.FromArgb(150, 150, 150); } }
+        public static Color Separator { get { return Color.FromArgb(60, 60, 60); } }
+        public static Color HoverBack { get { return Color.FromArgb(28, 28, 28); } }
+        public static Color OpenBack { get { return Color.FromArgb(16, 16, 16); } }
+        public static Color Input { get { return Color.FromArgb(0, 0, 0); } }
+        public static Color Text { get { return Color.FromArgb(200, 200, 200); } }
+        public static Color Bright { get { return Color.FromArgb(222, 222, 222); } }
+        public static Color Muted { get { return Color.FromArgb(130, 130, 130); } }
+        public static Color Ok { get { return Color.FromArgb(205, 205, 205); } }
+        public static Color OkBg { get { return Color.FromArgb(40, 40, 40); } }
+        public static Color Bad { get { return Color.FromArgb(0, 0, 0); } }
+        public static Color BadBg { get { return Color.FromArgb(205, 205, 205); } }
+        public static Color Warn { get { return Color.FromArgb(210, 210, 210); } }
+        public static Color WarnBg { get { return Color.FromArgb(75, 75, 75); } }
+        public static Color Info { get { return Color.FromArgb(180, 180, 180); } }
+        public static Color InfoBg { get { return Color.FromArgb(38, 38, 38); } }
+        public static Color NeutralBg { get { return Color.FromArgb(18, 18, 18); } }
+        public static Color NeutralFg { get { return Color.FromArgb(130, 130, 130); } }
+        public static Color SwitchOff { get { return Color.FromArgb(80, 80, 80); } }
+
+        // Retro look: square corners everywhere (radius is ignored)
+        public static GraphicsPath Rounded(RectangleF r, float radius)
+        {
+            var p = new GraphicsPath();
+            p.AddRectangle(r);
+            return p;
+        }
+
+        public static void Severity(string sev, out Color fg, out Color bg)
+        {
+            switch (sev)
+            {
+                case "High": fg = Bad; bg = BadBg; break;
+                case "Medium": fg = Warn; bg = WarnBg; break;
+                case "Low": fg = Info; bg = InfoBg; break;
+                default: fg = NeutralFg; bg = NeutralBg; break;
+            }
+        }
+
+        // Draws text optically centered in the rectangle: horizontally by the glyph outlines of the text and
+        // vertically by the height of capital letters. TextRenderer centers by the font cell, which pushes
+        // Oswald (tall ascent, short descent) visibly down in buttons, chips and pills.
+        public static void DrawCentered(Graphics g, string text, Font font, RectangleF r, Color color)
+        {
+            if (string.IsNullOrEmpty(text)) return;
+            var oldSmoothing = g.SmoothingMode;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            float emSize = g.DpiY * font.SizeInPoints / 72f;
+            using (var textPath = new GraphicsPath())
+            using (var capPath = new GraphicsPath())
+            using (var brush = new SolidBrush(color))
+            {
+                textPath.AddString(text, font.FontFamily, (int)font.Style, emSize, PointF.Empty, StringFormat.GenericTypographic);
+                capPath.AddString("H", font.FontFamily, (int)font.Style, emSize, PointF.Empty, StringFormat.GenericTypographic);
+                RectangleF tb = textPath.GetBounds(), cap = capPath.GetBounds();
+                using (var m = new Matrix())
+                {
+                    m.Translate((float)Math.Round(r.X + (r.Width - tb.Width) / 2f - tb.X),
+                                (float)Math.Round(r.Y + (r.Height - cap.Height) / 2f - cap.Y));
+                    textPath.Transform(m);
+                }
+                g.FillPath(brush, textPath);
+            }
+            g.SmoothingMode = oldSmoothing;
+        }
+
+        public static Color Blend(Color a, Color b, float weight)
+        {
+            return Color.FromArgb((int)(a.R * weight + b.R * (1 - weight)), (int)(a.G * weight + b.G * (1 - weight)), (int)(a.B * weight + b.B * (1 - weight)));
+        }
+    }
+
+    // Oswald Regular + SemiBold (SIL OFL, Google Fonts; static TTFs from googlefonts/OswaldFont) are embedded in the exe;
+    // falls back to Segoe UI. Static files are used because GDI+ cannot select weights of the variable font.
+    static class AppFonts
+    {
+        [DllImport("gdi32.dll")]
+        static extern IntPtr AddFontMemResourceEx(IntPtr pbFont, uint cbFont, IntPtr pdv, ref uint pcFonts);
+
+        static readonly PrivateFontCollection collection = new PrivateFontCollection();
+        static readonly FontFamily regular, semibold;
+
+        static AppFonts()
+        {
+            regular = Load("Oswald-Regular.ttf", "Oswald");
+            semibold = Load("Oswald-SemiBold.ttf", "Oswald SemiBold");
+        }
+
+        static FontFamily Load(string resource, string familyName)
+        {
+            try
+            {
+                byte[] data;
+                using (var s = Assembly.GetExecutingAssembly().GetManifestResourceStream(resource))
+                {
+                    if (s == null) return null;
+                    data = new byte[s.Length];
+                    s.Read(data, 0, data.Length);
+                }
+                IntPtr ptr = Marshal.AllocCoTaskMem(data.Length);   // must stay allocated for the life of the process
+                Marshal.Copy(data, 0, ptr, data.Length);
+                uint count = 0;
+                AddFontMemResourceEx(ptr, (uint)data.Length, IntPtr.Zero, ref count);
+                collection.AddMemoryFont(ptr, data.Length);
+                foreach (var f in collection.Families)
+                    if (f.Name == familyName) return f;
+            }
+            catch { }
+            return null;
+        }
+
+        // Retro variant: the UI uses the monospace Consolas (Oswald stays embedded but unused).
+        // Consolas is wider than the condensed Oswald, so sizes are scaled down.
+        public static Font Regular(float size)
+        {
+            return new Font("Consolas", size * 0.85f, FontStyle.Regular);
+        }
+
+        public static Font Semibold(float size)
+        {
+            return new Font("Consolas", size * 0.85f, FontStyle.Bold);
+        }
+    }
+
+    // Dark card with rounded corners and a thin green border
+    class Card : Panel
+    {
+        public Card()
+        {
+            DoubleBuffered = true;
+            ResizeRedraw = true;
+            BackColor = Theme.Back;
+            Padding = new Padding(20, 16, 20, 16);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var path = Theme.Rounded(new RectangleF(0.5f, 0.5f, Width - 2f, Height - 2f), 10))
+            using (var fill = new SolidBrush(Theme.Card))
+            using (var border = new Pen(Theme.Border))
+            {
+                e.Graphics.FillPath(fill, path);
+                e.Graphics.DrawPath(border, path);
+            }
+        }
+    }
+
+    // Terminal button: green outline with green text; hover/press fills it green with dark text.
+    // Secondary = muted outline (less important actions).
+    class AccentButton : Control
+    {
+        bool hover, down;
+        public bool Secondary;
+
+        public AccentButton()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+                     | ControlStyles.ResizeRedraw, true);
+            Cursor = Cursors.Hand;
+            Font = AppFonts.Semibold(12F);
+            Height = 38;
+        }
+
+        protected override void OnTextChanged(EventArgs e)
+        {
+            base.OnTextChanged(e);
+            Width = TextRenderer.MeasureText(Text, Font).Width + 36;
+            Invalidate();
+        }
+
+        protected override void OnEnabledChanged(EventArgs e) { base.OnEnabledChanged(e); Invalidate(); }
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; down = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnMouseDown(MouseEventArgs e) { down = true; Invalidate(); base.OnMouseDown(e); }
+        protected override void OnMouseUp(MouseEventArgs e) { down = false; Invalidate(); base.OnMouseUp(e); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.Clear(Parent != null ? Parent.BackColor : Theme.Back);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            Color line = !Enabled ? Theme.SwitchOff : Secondary ? Theme.Muted : App.Accent;
+            bool filled = Enabled && (hover || down);
+            Color fill = !filled ? Theme.Card : down ? App.AccentDown : Secondary ? Theme.Muted : App.Accent;
+            Color text = filled ? Theme.Back : !Enabled ? Theme.SwitchOff : Secondary ? Theme.Text : App.Accent;
+            using (var path = Theme.Rounded(new RectangleF(1f, 1f, Width - 2.5f, Height - 2.5f), 4))
+            using (var b = new SolidBrush(fill))
+            using (var pen = new Pen(line, 1.5f))
+            {
+                g.FillPath(b, path);
+                g.DrawPath(pen, path);
+            }
+            Theme.DrawCentered(g, Text, Font, new RectangleF(0, 0, Width, Height), text);
+        }
+    }
+
+    enum RunState { None, Running, Ok, Warning, Problem }
+
+    // Large status icon in the header card; spins while the check is running
+    class StatusIcon : Control
+    {
+        RunState state;
+        float angle;
+        readonly System.Windows.Forms.Timer spin = new System.Windows.Forms.Timer { Interval = 40 };
+
+        public StatusIcon()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+                     | ControlStyles.ResizeRedraw, true);
+            BackColor = Theme.Card;
+            spin.Tick += delegate { angle = (angle + 12) % 360; Invalidate(); };
+        }
+
+        public RunState State
+        {
+            get { return state; }
+            set { state = value; spin.Enabled = value == RunState.Running; Invalidate(); }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.Clear(BackColor);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            float s = Math.Min(Width, Height) - 4;
+            var r = new RectangleF(2, (Height - s) / 2f, s, s);
+            Func<float, float, PointF> pt = (x, y) => new PointF(r.X + s * x, r.Y + s * y);
+
+            if (state == RunState.Running || state == RunState.None)
+            {
+                float w = s * 0.09f;
+                var ring = new RectangleF(r.X + w, r.Y + w, s - 2 * w, s - 2 * w);
+                using (var track = new Pen(state == RunState.Running ? Theme.InfoBg : Theme.Separator, w))
+                    g.DrawEllipse(track, ring);
+                if (state == RunState.Running)
+                    using (var arc = new Pen(Theme.Info, w) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                        g.DrawArc(arc, ring, angle, 100);
+                return;
+            }
+
+            Color fg = state == RunState.Ok ? Theme.Ok : state == RunState.Problem ? Theme.Bad : Theme.Warn;
+            Color bg = state == RunState.Ok ? Theme.OkBg : state == RunState.Problem ? Theme.BadBg : Theme.WarnBg;
+            using (var b = new SolidBrush(bg))
+            using (var tile = Theme.Rounded(r, s * 0.08f))
+                g.FillPath(b, tile);
+            using (var pen = new Pen(fg, s * 0.085f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+            {
+                if (state == RunState.Ok)
+                    g.DrawLines(pen, new[] { pt(0.30f, 0.52f), pt(0.44f, 0.65f), pt(0.70f, 0.38f) });
+                else if (state == RunState.Problem)
+                {
+                    g.DrawLine(pen, pt(0.36f, 0.36f), pt(0.64f, 0.64f));
+                    g.DrawLine(pen, pt(0.64f, 0.36f), pt(0.36f, 0.64f));
+                }
+                else
+                {
+                    g.DrawLine(pen, pt(0.5f, 0.27f), pt(0.5f, 0.55f));
+                    using (var dot = new SolidBrush(fg)) g.FillEllipse(dot, r.X + s * 0.445f, r.Y + s * 0.66f, s * 0.11f, s * 0.11f);
+                }
+            }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) spin.Dispose();
+            base.Dispose(disposing);
+        }
+    }
+
+    // Severity filter: rounded pill "High 6", on = colored, off = outlined grey
+    class SeverityChip : Control
+    {
+        public readonly string Severity;
+        int count;
+        bool on = true, hover;
+        public event EventHandler Toggled;
+
+        public SeverityChip(string severity)
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+                     | ControlStyles.ResizeRedraw, true);
+            Severity = severity;
+            Cursor = Cursors.Hand;
+            Font = AppFonts.Semibold(10.5F);
+            Height = 32;
+            Margin = new Padding(0, 4, 8, 0);
+            UpdateWidth();
+        }
+
+        string Label { get { return Severity.ToUpperInvariant() + "  " + count; } }
+
+        public int Count { get { return count; } set { count = value; UpdateWidth(); Invalidate(); } }
+        public bool On { get { return on; } set { on = value; Invalidate(); } }
+
+        void UpdateWidth() { Width = TextRenderer.MeasureText(Label, Font).Width + 28; }
+
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnClick(EventArgs e) { base.OnClick(e); on = !on; Invalidate(); if (Toggled != null) Toggled(this, EventArgs.Empty); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.Clear(Parent != null ? Parent.BackColor : Theme.Card);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            Color fg, bg;
+            Theme.Severity(Severity, out fg, out bg);
+            var rect = new RectangleF(1f, 1f, Width - 2.5f, Height - 2.5f);
+            using (var path = Theme.Rounded(rect, 4))
+            {
+                if (on)
+                    using (var b = new SolidBrush(hover ? Theme.Blend(fg, bg, 0.15f) : bg)) g.FillPath(b, path);
+                using (var pen = new Pen(on ? fg : Theme.Border, 1.2f)) g.DrawPath(pen, path);
+            }
+            Theme.DrawCentered(g, Label, Font, new RectangleF(0, 0, Width, Height), on ? fg : (hover ? Theme.Text : Theme.Muted));
+        }
+    }
+
+    class Finding
+    {
+        public string Severity, Category, Item, Details, Mitre, Timestamp;
+        public int Rank;
+        public string Main = "";
+        public readonly List<string> Reasons = new List<string>();
+        public string Extra = "";      // text after the reasons, e.g. " | external connections: ..."
+        public string Why = "";   // why the check exists (config\check_reasons.json)
+        public readonly List<string> Steps = new List<string>();   // recommended remediation (config\remediation.json)
+        public bool Expanded;
+
+        public static int RankOf(string sev)
+        {
+            switch (sev) { case "High": return 3; case "Medium": return 2; case "Low": return 1; default: return 0; }
+        }
+
+        // Details from the script look like "<text>  [reason1; reason2]<extra>"
+        public void Split()
+        {
+            string d = Details ?? "";
+            int open = d.LastIndexOf("  [", StringComparison.Ordinal);
+            int close = open >= 0 ? d.IndexOf(']', open) : -1;
+            if (open >= 0 && close > open)
+            {
+                Main = d.Substring(0, open).Trim();
+                foreach (var r in d.Substring(open + 3, close - open - 3).Split(new[] { "; " }, StringSplitOptions.RemoveEmptyEntries))
+                    if (r.Trim().Length > 0) Reasons.Add(r.Trim());
+                Extra = d.Substring(close + 1).Trim().TrimStart('|').Trim();
+            }
+            else Main = d.Trim();
+        }
+
+        public string ToClipboardText()
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("[" + Severity + "] " + Category);
+            sb.AppendLine(Item);
+            if (Main.Length > 0) sb.AppendLine(Main);
+            foreach (var r in Reasons) sb.AppendLine("  - " + r);
+            if (Extra.Length > 0) sb.AppendLine(Extra);
+            if (!string.IsNullOrEmpty(Mitre)) sb.AppendLine("MITRE: " + Mitre);
+            if (!string.IsNullOrEmpty(Timestamp)) sb.AppendLine("Time: " + Timestamp);
+            if (Why.Length > 0) sb.AppendLine("Why this is checked: " + Why);
+            if (Steps.Count > 0 && Rank >= 1)
+            {
+                sb.AppendLine("Remediation:");
+                for (int i = 0; i < Steps.Count; i++) sb.AppendLine("  " + (i + 1) + ". " + Steps[i].Replace("<item>", Item));
+            }
+            return sb.ToString();
+        }
+    }
+
+    // Scrollable list of findings. A click on a row expands it and shows the full details,
+    // the reasons why it was flagged, the MITRE technique and the time (like the HTML report).
+    class FindingList : ScrollableControl
+    {
+        const TextFormatFlags Wrap = TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPrefix;
+        const TextFormatFlags Line = TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.VerticalCenter;
+
+        List<Finding> items = new List<Finding>();
+        int[] tops = new int[0], heights = new int[0];
+        int hover = -1;
+        int rowH;
+        bool layingOut;
+        readonly Font fItem = AppFonts.Semibold(11.5F), fSmall = AppFonts.Regular(10.5F), fLabel = AppFonts.Semibold(9F),
+                      fPill = AppFonts.Semibold(9.5F), fTitle = AppFonts.Semibold(10.5F), fMeta = AppFonts.Regular(10.5F), fBody = new Font("Consolas", 9.5F);
+        public string EmptyText = "No findings to show.";
+        readonly ContextMenuStrip menu = new ContextMenuStrip();
+        int menuIndex = -1;
+
+        [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+        static extern int SetWindowTheme(IntPtr hWnd, string subAppName, string subIdList);
+
+        public FindingList()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+                     | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+            AutoScroll = true;
+            BackColor = Theme.Card;
+            // Dark scrollbar (Windows 10 1809+ "DarkMode_Explorer" theme); ignored on older systems
+            HandleCreated += delegate { try { SetWindowTheme(Handle, "DarkMode_Explorer", null); } catch { } };
+            rowH = Math.Max(44, fItem.Height + 20);
+            menu.Renderer = new ToolStripProfessionalRenderer(new TerminalMenuColors());
+            menu.BackColor = Theme.Card;
+            menu.ForeColor = Theme.Text;
+            menu.ShowImageMargin = false;
+            menu.Items.Add("Copy finding", null, delegate { if (menuIndex >= 0 && menuIndex < items.Count) Copy(items[menuIndex].ToClipboardText()); });
+            menu.Items.Add("Copy all shown findings", null, delegate
+            {
+                var sb = new StringBuilder();
+                foreach (var f in items) { sb.AppendLine(f.ToClipboardText()); }
+                Copy(sb.ToString());
+            });
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("Expand all", null, delegate { foreach (var f in items) f.Expanded = true; Relayout(); });
+            menu.Items.Add("Collapse all", null, delegate { foreach (var f in items) f.Expanded = false; Relayout(); });
+        }
+
+        static void Copy(string text)
+        {
+            try { if (!string.IsNullOrEmpty(text)) Clipboard.SetText(text); } catch { }
+        }
+
+        public void SetItems(List<Finding> list)
+        {
+            items = list ?? new List<Finding>();
+            hover = -1;
+            AutoScrollPosition = Point.Empty;
+            Relayout();
+        }
+
+        int DetailX { get { return 40; } }
+        // Width of the wrapped detail text (the same value is used for measuring and drawing)
+        int TextWidth { get { return Math.Max(120, ClientSize.Width - DetailX - 32 - 24); } }
+
+        // Expanded part = a definition list: label on the left (small, muted), text on the right.
+        // The ITEM title uses the UI font; the sections below it (DETAIL, WHY CHECKED, REMEDIATION, CATEGORY) use
+        // one monospace font (fBody = Consolas), one color and the same spacing, so all sections read the same way.
+        const int RowGap = 10;
+        static readonly string[] LabelNames = { "ITEM", "DETAIL", "FLAGGED BECAUSE", "WHY CHECKED", "REMEDIATION", "MITRE ATT&CK", "CATEGORY", "TIME" };
+
+        // ITEM = title font; MITRE ATT&CK and TIME = UI font (Oswald); the other sections = Consolas
+        Font RowFont(string label)
+        {
+            if (label == LabelNames[0]) return fTitle;
+            if (label == LabelNames[5] || label == LabelNames[7]) return fMeta;
+            return fBody;
+        }
+
+        int LabelWidth { get { return TextRenderer.MeasureText("FLAGGED BECAUSE", fLabel).Width + 18; } }
+        int BodyX { get { return DetailX + 32 + LabelWidth; } }
+        int BodyWidth { get { return Math.Max(120, ClientSize.Width - BodyX - 24); } }
+
+        static List<Tuple<string, string>> Rows(Finding f)
+        {
+            var rows = new List<Tuple<string, string>>();
+            rows.Add(Tuple.Create(LabelNames[0], f.Item));
+            string detail = f.Main;
+            if (f.Extra.Length > 0) detail = (detail.Length > 0 ? detail + "\n" : "") + f.Extra;
+            // "path | actions: ... | user: ..." -> one part per line
+            detail = detail.Replace(" | ", "\n");
+            // Trailing "(Account: LocalSystem; Start: auto start)" -> one "key: value" line per item (aligned like the rest)
+            detail = System.Text.RegularExpressions.Regex.Replace(detail,
+                @"\s+\(([A-Za-z][A-Za-z ]{1,20}: [^;()\n]*(?:; [A-Za-z][A-Za-z ]{1,20}: [^;()\n]*)+)\)[ \t]*$",
+                m => "\n" + m.Groups[1].Value.Replace("; ", "\n"), System.Text.RegularExpressions.RegexOptions.Multiline);
+            // Defender resources "file:_C:\a.zip; webfile:_C:\a.zip|https://..." -> one resource per line, URL on its own line
+            detail = System.Text.RegularExpressions.Regex.Replace(detail, @";\s+(?=[A-Za-z][A-Za-z0-9_\-]{1,24}:(?![\\/]))", "\n");
+            detail = System.Text.RegularExpressions.Regex.Replace(detail, @"\|(?=https?://)", "\n");
+            if (detail.Length > 0) rows.Add(Tuple.Create(LabelNames[1], detail));
+            if (f.Reasons.Count > 0)
+            {
+                var lines = new List<string>();
+                foreach (var r in f.Reasons) lines.Add("•  " + r);
+                rows.Add(Tuple.Create(LabelNames[2], string.Join("\n", lines.ToArray())));
+            }
+            if (f.Why.Length > 0) rows.Add(Tuple.Create(LabelNames[3], f.Why));
+            if (f.Steps.Count > 0 && f.Rank >= 1)
+            {
+                // Recommended steps from config\remediation.json, numbered; <item> = this finding
+                var lines = new List<string>();
+                for (int i = 0; i < f.Steps.Count; i++)
+                    lines.Add((i + 1) + ". " + f.Steps[i].Replace("<item>", f.Item));
+                rows.Add(Tuple.Create(LabelNames[4], string.Join("\n", lines.ToArray())));
+            }
+            if (!string.IsNullOrEmpty(f.Mitre)) rows.Add(Tuple.Create(LabelNames[5], f.Mitre));
+            rows.Add(Tuple.Create(LabelNames[6], f.Category));
+            if (!string.IsNullOrEmpty(f.Timestamp)) rows.Add(Tuple.Create(LabelNames[7], f.Timestamp));
+            return rows;
+        }
+
+        int RowHeight(string label, string text)
+        {
+            int body = LayoutBody(null, label, text, BodyX, 0, BodyWidth, Theme.Text);
+            return Math.Max(body, fLabel.Height);
+        }
+
+        static readonly System.Text.RegularExpressions.Regex listMarker =
+            new System.Text.RegularExpressions.Regex(@"^(\d+\.|\u2022)\s+");
+        // DETAIL lines like "user: Win11\Test" or "events: 5" (not drive letters "C:\" or URLs "https://")
+        static readonly System.Text.RegularExpressions.Regex detailKey =
+            new System.Text.RegularExpressions.Regex(@"^([A-Za-z][A-Za-z0-9 _\-]{1,24}):(?![\\/])\s*(.*)$");
+
+        // Measures (g == null) or draws the text of one row. List rows (REMEDIATION "1. ...", FLAGGED BECAUSE "\u2022 ...")
+        // get a hanging indent: the markers have their own column and wrapped lines stay aligned with the text, not the number.
+        // DETAIL rows work the same way with "key: value" lines: keys in one column, all values start at the same position.
+        int LayoutBody(Graphics g, string label, string text, int x, int y, int w, Color color)
+        {
+            var font = RowFont(label);
+            var lines = text.Split('\n');
+            var marks = new string[lines.Length];
+            int markW = 0;
+            bool keyed = label == LabelNames[1];
+            for (int i = 0; i < lines.Length; i++)
+            {
+                if (keyed)
+                {
+                    var k = detailKey.Match(lines[i]);
+                    if (!k.Success) continue;
+                    marks[i] = k.Groups[1].Value + ":";
+                    string v = k.Groups[2].Value;
+                    if (v.Length > 3 && v[0] == '_' && v[2] == ':') v = v.Substring(1);   // Defender "file:_C:\..." -> "C:\..."
+                    lines[i] = v;
+                }
+                else
+                {
+                    var m = listMarker.Match(lines[i]);
+                    if (!m.Success) continue;
+                    marks[i] = m.Groups[1].Value;
+                    lines[i] = lines[i].Substring(m.Length);
+                }
+                markW = Math.Max(markW, TextRenderer.MeasureText(marks[i] + " ", font, Size.Empty, TextFormatFlags.NoPrefix).Width);
+            }
+            if (markW == 0)
+            {
+                int h = TextRenderer.MeasureText(text, font, new Size(w, int.MaxValue), Wrap).Height;
+                if (g != null) TextRenderer.DrawText(g, text, font, new Rectangle(x, y, w, h + 2), color, Wrap);
+                return h;
+            }
+            int top = y;
+            bool afterKey = false;
+            for (int i = 0; i < lines.Length; i++)
+            {
+                // DETAIL: a line without a key after a "key: value" line continues that value (e.g. the URL of webfile)
+                if (keyed && marks[i] != null) afterKey = true;
+                int indent = marks[i] != null || afterKey ? markW : 0;
+                string t = lines[i].Length > 0 ? lines[i] : " ";
+                int lh = TextRenderer.MeasureText(t, font, new Size(w - indent, int.MaxValue), Wrap).Height;
+                if (g != null)
+                {
+                    if (marks[i] != null)
+                        TextRenderer.DrawText(g, marks[i], font, new Rectangle(x, y, markW, font.Height + 2), Theme.Muted,
+                            TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+                    TextRenderer.DrawText(g, t, font, new Rectangle(x + indent, y, w - indent, lh + 2), color, Wrap);
+                }
+                y += lh;
+                if (!keyed && i < lines.Length - 1 && marks[i] != null) y += 4;   // small gap between list items
+            }
+            return y - top;
+        }
+
+        int DetailHeight(Finding f)
+        {
+            int h = 6;
+            foreach (var r in Rows(f)) h += RowHeight(r.Item1, r.Item2) + RowGap;
+            return h + 8;
+        }
+
+        public void Relayout()
+        {
+            if (layingOut) return;
+            layingOut = true;
+            try
+            {
+                tops = new int[items.Count];
+                heights = new int[items.Count];
+                int y = 0;
+                for (int i = 0; i < items.Count; i++)
+                {
+                    tops[i] = y;
+                    heights[i] = rowH + (items[i].Expanded ? DetailHeight(items[i]) : 0);
+                    y += heights[i];
+                }
+                AutoScrollMinSize = new Size(0, y);
+            }
+            finally { layingOut = false; }
+            Invalidate();
+        }
+
+        protected override void OnResize(EventArgs e) { base.OnResize(e); Relayout(); }
+        protected override void OnScroll(ScrollEventArgs se) { base.OnScroll(se); Invalidate(); }
+        protected override void OnMouseWheel(MouseEventArgs e) { base.OnMouseWheel(e); Invalidate(); }
+
+        int IndexAt(int y)
+        {
+            int cy = y - AutoScrollPosition.Y;
+            for (int i = 0; i < tops.Length; i++)
+                if (cy >= tops[i] && cy < tops[i] + heights[i]) return i;
+            return -1;
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            int i = IndexAt(e.Y);
+            bool onHeader = i >= 0 && e.Y - AutoScrollPosition.Y - tops[i] < rowH;
+            Cursor = onHeader ? Cursors.Hand : Cursors.Default;
+            if (i != hover) { hover = i; Invalidate(); }
+        }
+
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hover = -1; Invalidate(); }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            Focus();
+            int i = IndexAt(e.Y);
+            if (i < 0) return;
+            if (e.Button == MouseButtons.Right)
+            {
+                menuIndex = i;
+                menu.Show(this, e.Location);
+                return;
+            }
+            if (e.Button == MouseButtons.Left && e.Y - AutoScrollPosition.Y - tops[i] < rowH)
+            {
+                items[i].Expanded = !items[i].Expanded;
+                Relayout();
+            }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.Clear(BackColor);
+            int w = ClientSize.Width, oy = AutoScrollPosition.Y;
+            if (items.Count == 0)
+            {
+                TextRenderer.DrawText(g, EmptyText, fSmall, new Rectangle(0, 0, w, 80), Theme.Muted,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                return;
+            }
+            bool showTime = w > 760;
+            int timeW = showTime ? TextRenderer.MeasureText("2026-10-31 12:00:00", fSmall).Width + 8 : 0;
+            int catW = Math.Min(260, (int)(w * 0.26));
+            int pillW = TextRenderer.MeasureText("MEDIUM", fPill).Width + 16;
+
+            for (int i = 0; i < items.Count; i++)
+            {
+                int top = tops[i] + oy;
+                if (top > ClientSize.Height || top + heights[i] < 0) continue;
+                var f = items[i];
+                if (f.Expanded)
+                    using (var b = new SolidBrush(Theme.OpenBack)) g.FillRectangle(b, 0, top, w, heights[i]);
+                else if (i == hover)
+                    using (var b = new SolidBrush(Theme.HoverBack)) g.FillRectangle(b, 0, top, w, rowH);
+
+                // Chevron
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                float cx = 14, cy = top + rowH / 2f;
+                using (var pen = new Pen(Theme.Muted, 1.6f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+                {
+                    if (f.Expanded) g.DrawLines(pen, new[] { new PointF(cx - 4, cy - 2), new PointF(cx, cy + 2), new PointF(cx + 4, cy - 2) });
+                    else g.DrawLines(pen, new[] { new PointF(cx - 2, cy - 4), new PointF(cx + 2, cy), new PointF(cx - 2, cy + 4) });
+                }
+
+                // Severity pill
+                Color fg, bg;
+                Theme.Severity(f.Severity, out fg, out bg);
+                int pillH = fPill.Height + 4;
+                var pill = new RectangleF(32, top + (rowH - pillH) / 2f, pillW, pillH);
+                using (var path = Theme.Rounded(pill, 3))
+                using (var b = new SolidBrush(bg))
+                using (var pen = new Pen(fg, 1f))
+                {
+                    g.FillPath(b, path);
+                    g.DrawPath(pen, path);
+                }
+                Theme.DrawCentered(g, f.Severity.ToUpperInvariant(), fPill, pill, fg);
+
+                // Category | item | time
+                int x = 32 + pillW + 14;
+                TextRenderer.DrawText(g, f.Category, fSmall, new Rectangle(x, top, catW - 10, rowH), Theme.Muted, Line);
+                x += catW;
+                int itemW = w - x - timeW - 12;
+                TextRenderer.DrawText(g, f.Item, fItem, new Rectangle(x, top, Math.Max(40, itemW), rowH), Theme.Text, Line);
+                if (showTime && !string.IsNullOrEmpty(f.Timestamp))
+                    TextRenderer.DrawText(g, f.Timestamp, fSmall, new Rectangle(w - timeW - 8, top, timeW, rowH), Theme.Muted,
+                        Line | TextFormatFlags.Right);
+
+                // Expanded details
+                if (f.Expanded)
+                {
+                    int y = top + rowH + 6, bx = BodyX, bw = BodyWidth;
+                    foreach (var r in Rows(f))
+                    {
+                        var font = RowFont(r.Item1);
+                        int h = RowHeight(r.Item1, r.Item2);
+                        // Label vertically centered on the first line of the row text
+                        int labelOffset = (font.Height - fLabel.Height) / 2;
+                        TextRenderer.DrawText(g, r.Item1, fLabel, new Rectangle(DetailX + 32, y + labelOffset, LabelWidth, fLabel.Height),
+                            Theme.Muted, TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+                        LayoutBody(g, r.Item1, r.Item2, bx, y, bw, r.Item1 == LabelNames[0] ? Theme.Bright : Theme.Text);
+                        y += h + RowGap;
+                    }
+                    using (var pen = new Pen(fg, 3f)) g.DrawLine(pen, DetailX + 16, top + rowH + 6, DetailX + 16, top + heights[i] - 14);
+                }
+
+                using (var sep = new Pen(Theme.Separator))
+                    g.DrawLine(sep, 0, top + heights[i] - 1, w, top + heights[i] - 1);
+            }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) { fItem.Dispose(); fSmall.Dispose(); fLabel.Dispose(); fPill.Dispose(); fTitle.Dispose(); fMeta.Dispose(); fBody.Dispose(); menu.Dispose(); }
+            base.Dispose(disposing);
+        }
+    }
+
+    class TerminalMenuColors : ProfessionalColorTable
+    {
+        public override Color ToolStripDropDownBackground { get { return Theme.Card; } }
+        public override Color MenuBorder { get { return Theme.Border; } }
+        public override Color MenuItemBorder { get { return Theme.Border; } }
+        public override Color MenuItemSelected { get { return Theme.OkBg; } }
+        public override Color SeparatorDark { get { return Theme.Border; } }
+        public override Color SeparatorLight { get { return Theme.Card; } }
+        public override Color ImageMarginGradientBegin { get { return Theme.Card; } }
+        public override Color ImageMarginGradientMiddle { get { return Theme.Card; } }
+        public override Color ImageMarginGradientEnd { get { return Theme.Card; } }
+    }
+
+    // Why each check exists (config\check_reasons.json) and recommended remediation (config\remediation.json).
+    static class CheckReasons
+    {
+        static readonly Dictionary<string, string> map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+
+        public static void Load(string path)
+        {
+            map.Clear();
+            try
+            {
+                if (!File.Exists(path)) return;
+                var root = new JavaScriptSerializer().DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
+                if (root == null) return;
+                foreach (var kv in root)
+                {
+                    var d = kv.Value as Dictionary<string, object>;
+                    if (d == null) continue;
+                    object why;
+                    d.TryGetValue("Why", out why);
+                    map[kv.Key] = (Convert.ToString(why) ?? "").Trim();
+                }
+            }
+            catch { }
+        }
+
+        static readonly Dictionary<string, List<string>> steps = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+
+        // config\remediation.json: { "<category>": { "Steps": [ ... ] }, "_General": {...} }
+        public static void LoadRemediation(string path)
+        {
+            steps.Clear();
+            try
+            {
+                if (!File.Exists(path)) return;
+                var root = new JavaScriptSerializer().DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
+                if (root == null) return;
+                foreach (var kv in root)
+                {
+                    if (kv.Key.StartsWith("_")) continue;
+                    var d = kv.Value as Dictionary<string, object>;
+                    object s;
+                    if (d == null || !d.TryGetValue("Steps", out s)) continue;
+                    var arr = s as object[];
+                    if (arr == null) continue;
+                    var list = new List<string>();
+                    foreach (var x in arr) if (x != null) list.Add(Convert.ToString(x).Trim());
+                    steps[kv.Key] = list;
+                }
+            }
+            catch { }
+        }
+
+        public static void Apply(Finding f)
+        {
+            if (f.Category == null) return;
+            string why;
+            if (map.TryGetValue(f.Category, out why)) f.Why = why;
+            List<string> s;
+            if (steps.TryGetValue(f.Category, out s)) f.Steps.AddRange(s);
+        }
+    }
+
+    // Loaded content of one report folder
+    class Report
+    {
+        public string Folder;
+        public string Computer = "", ReportTime = "", Os = "";
+        public double Duration;
+        public int WindowDays;
+        public bool Elevated, Quick;
+        public readonly List<Finding> Findings = new List<Finding>();
+        public readonly List<string> Notes = new List<string>();
+
+        static string S(Dictionary<string, object> d, string key)
+        {
+            object v;
+            return d != null && d.TryGetValue(key, out v) && v != null ? Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture) : "";
+        }
+
+        static IEnumerable<Dictionary<string, object>> List(object o)
+        {
+            var arr = o as object[];
+            if (arr == null) { var al = o as System.Collections.ArrayList; if (al != null) arr = al.ToArray(); }
+            if (arr != null) { foreach (var x in arr) { var d = x as Dictionary<string, object>; if (d != null) yield return d; } }
+            else { var single = o as Dictionary<string, object>; if (single != null) yield return single; }
+        }
+
+        public static Report Load(string folder)
+        {
+            string json = File.ReadAllText(Path.Combine(folder, "findings.json"), Encoding.UTF8);
+            var root = new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.DeserializeObject(json) as Dictionary<string, object>;
+            if (root == null) throw new InvalidDataException("findings.json has an unexpected format");
+            var r = new Report { Folder = folder };
+            object hostObj;
+            root.TryGetValue("Host", out hostObj);
+            var host = hostObj as Dictionary<string, object>;
+            r.Computer = S(host, "ComputerName");
+            r.ReportTime = S(host, "ReportTime");
+            r.Os = S(host, "OS");
+            double dur; double.TryParse(S(host, "DurationSec"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out dur);
+            r.Duration = dur;
+            int days; int.TryParse(S(host, "WindowDays"), out days); r.WindowDays = days;
+            r.Elevated = S(host, "Elevated").Equals("True", StringComparison.OrdinalIgnoreCase);
+            r.Quick = S(host, "Quick").Equals("True", StringComparison.OrdinalIgnoreCase);
+
+            object fo, no;
+            if (root.TryGetValue("Findings", out fo))
+                foreach (var d in List(fo))
+                {
+                    var f = new Finding { Severity = S(d, "Severity"), Category = S(d, "Category"), Item = S(d, "Item"),
+                        Details = S(d, "Details"), Mitre = S(d, "Mitre"), Timestamp = S(d, "Timestamp") };
+                    f.Rank = Finding.RankOf(f.Severity);
+                    f.Split();
+                    CheckReasons.Apply(f);
+                    r.Findings.Add(f);
+                }
+            if (root.TryGetValue("Notes", out no))
+                foreach (var d in List(no)) r.Notes.Add(S(d, "Check") + ": " + S(d, "Message"));
+            r.Findings.Sort((a, b) => b.Rank != a.Rank ? b.Rank.CompareTo(a.Rank) : string.Compare(a.Category, b.Category, StringComparison.OrdinalIgnoreCase));
+            return r;
+        }
+
+        public int Count(string sev)
+        {
+            int n = 0;
+            foreach (var f in Findings) if (f.Severity == sev) n++;
+            return n;
+        }
+    }
+
+    static class Program
+    {
+        [STAThread]
+        static void Main()
+        {
+            bool created;
+#if PREVIEW
+            const string mutexName = "Global\\RansomwareChecker_Preview";   // preview build runs next to the real app
+#else
+            const string mutexName = "Global\\RansomwareChecker_Retro";   // retro copy runs next to the real app
+#endif
+            using (new Mutex(true, mutexName, out created))
+            {
+                if (!created)
+                {
+                    MessageBox.Show("RansomwareChecker is already running.", App.Name, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                Application.Run(new MainForm());
+            }
+        }
+    }
+
+    class MainForm : Form
+    {
+        static readonly string[] Severities = { "High", "Medium", "Low", "Info" };
+
+        readonly string appDir = AppDomain.CurrentDomain.BaseDirectory;
+        readonly string iniPath = Path.ChangeExtension(Application.ExecutablePath, ".ini");
+        readonly string scriptPath;
+        readonly string reportsDir;
+        int daysBack = 30;
+        bool quick, runOnStart = true;
+
+        Report report;
+        bool reportIsPrevious;        // shown report is from an earlier run (before the first check of this session)
+        string runError;
+        volatile bool running, cancelled;
+        Process proc;
+        DateTime runStarted;
+        int checksDone, checksTotal;
+        string lastCheckLine = "";
+
+        AccentButton btnRun, btnHtml, btnFolder, btnFix;
+        StatusIcon statusIcon;
+        Label lblHeadline, lblSub, lblListTitle, lblNotes, lblReport;
+        FindingList list;
+        TextBox search;
+        readonly List<SeverityChip> chips = new List<SeverityChip>();
+        System.Windows.Forms.Timer ticker;
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, string lParam);
+
+        public MainForm()
+        {
+            scriptPath = Path.Combine(appDir, "RansomwareChecker.ps1");
+            reportsDir = Path.Combine(appDir, "Reports");
+            CheckReasons.Load(Path.Combine(appDir, @"config\check_reasons.json"));
+            CheckReasons.LoadRemediation(Path.Combine(appDir, @"config\remediation.json"));
+            LoadSettings();
+            InitWindow();
+            BuildUi();
+            LoadLatestReport();
+            RefreshAll();
+#if PREVIEW
+            // Preview build (screenshots): expand the first finding whose Item contains RC_PREVIEW_EXPAND (or the first one)
+            if (report != null && report.Findings.Count > 0)
+            {
+                string want = Environment.GetEnvironmentVariable("RC_PREVIEW_EXPAND") ?? "";
+                var picks = new List<Finding>();
+                foreach (var w in want.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+                    foreach (var f in report.Findings) if (Has(f.Item, w.Trim()) && !picks.Contains(f)) { picks.Add(f); break; }
+                if (picks.Count == 0) picks.Add(report.Findings[0]);
+                for (int i = picks.Count - 1; i >= 0; i--)
+                {
+                    picks[i].Expanded = true;
+                    report.Findings.Remove(picks[i]);
+                    report.Findings.Insert(0, picks[i]);
+                }
+                ApplyFilter();
+                int scroll;
+                if (int.TryParse(Environment.GetEnvironmentVariable("RC_PREVIEW_SCROLL"), out scroll))
+                    Shown += delegate { list.AutoScrollPosition = new Point(0, scroll); list.Invalidate(); };
+            }
+#endif
+            ticker = new System.Windows.Forms.Timer { Interval = 1000 };
+            ticker.Tick += delegate { if (running) UpdateHero(); };
+            ticker.Start();
+            Shown += delegate
+            {
+                if (runOnStart) StartRun();
+            };
+        }
+
+        // ---------- Settings ----------
+
+        void LoadSettings()
+        {
+            if (!File.Exists(iniPath))
+            {
+                try
+                {
+                    File.WriteAllText(iniPath,
+                        "; RansomwareChecker settings\r\n" +
+                        "; DaysBack: time window in days for event logs and \"recently created\" heuristics\r\n" +
+                        "DaysBack=30\r\n" +
+                        "; Quick: 1 = skip the file system sweep (staging folders, ransom notes)\r\n" +
+                        "Quick=0\r\n" +
+                        "; RunOnStart: 1 = run a check when the app starts, 0 = only on request\r\n" +
+                        "RunOnStart=1\r\n", Encoding.UTF8);
+                }
+                catch { }
+            }
+            try
+            {
+                foreach (var raw in File.ReadAllLines(iniPath, Encoding.UTF8))
+                {
+                    string line = raw.Trim();
+                    if (line.Length == 0 || line.StartsWith(";") || line.StartsWith("#") || line.StartsWith("[")) continue;
+                    int eq = line.IndexOf('=');
+                    if (eq < 0) continue;
+                    string key = line.Substring(0, eq).Trim().ToLowerInvariant(), val = line.Substring(eq + 1).Trim();
+                    bool on = val == "1" || val.Equals("true", StringComparison.OrdinalIgnoreCase);
+                    int n;
+                    switch (key)
+                    {
+                        case "daysback": if (int.TryParse(val, out n) && n >= 1 && n <= 3650) daysBack = n; break;
+                        case "quick": quick = on; break;
+                        case "runonstart": runOnStart = on; break;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        void SaveIniValue(string key, string value)
+        {
+            try
+            {
+                var lines = File.Exists(iniPath) ? new List<string>(File.ReadAllLines(iniPath, Encoding.UTF8)) : new List<string>();
+                bool found = false;
+                for (int i = 0; i < lines.Count; i++)
+                {
+                    string t = lines[i].Trim();
+                    int eq = t.IndexOf('=');
+                    if (eq > 0 && !t.StartsWith(";") && t.Substring(0, eq).Trim().Equals(key, StringComparison.OrdinalIgnoreCase))
+                    { lines[i] = key + "=" + value; found = true; }
+                }
+                if (!found) lines.Add(key + "=" + value);
+                File.WriteAllLines(iniPath, lines.ToArray(), Encoding.UTF8);
+            }
+            catch { }
+        }
+
+        // ---------- UI ----------
+
+        void InitWindow()
+        {
+            Text = App.Name;
+            using (var s = Assembly.GetExecutingAssembly().GetManifestResourceStream("App.ico"))
+                Icon = s != null ? new Icon(s) : SystemIcons.Shield;
+            Size = new Size(1040, 720);
+            MinimumSize = new Size(720, 520);
+            StartPosition = FormStartPosition.CenterScreen;
+            Font = AppFonts.Regular(11F);
+            AutoScaleMode = AutoScaleMode.None;
+            Padding = new Padding(20, 16, 20, 8);
+            DoubleBuffered = true;
+            FormClosing += delegate
+            {
+                cancelled = true;
+                var p = proc;
+                if (p != null) try { if (!p.HasExited) p.Kill(); } catch { }
+            };
+        }
+
+        void BuildUi()
+        {
+            SuspendLayout();
+            while (Controls.Count > 0) { var c = Controls[0]; Controls.RemoveAt(0); c.Dispose(); }
+            chips.Clear();
+            BackColor = Theme.Back;
+            ForeColor = Theme.Text;
+            ApplyTitleBarTheme();
+            var tips = new ToolTip();
+
+            // Toolbar: run (on request), remediation plan, HTML report, report folder | version
+            var toolbar = new Panel { Dock = DockStyle.Top, Height = 40, BackColor = Theme.Back };
+            var buttons = new FlowLayoutPanel { Dock = DockStyle.Left, AutoSize = true, WrapContents = false, BackColor = Theme.Back, Padding = Padding.Empty };
+            btnRun = new AccentButton { Text = "Run check again", Margin = new Padding(0, 0, 8, 0) };
+            btnRun.Click += delegate { if (running) StopRun(); else StartRun(); };
+            tips.SetToolTip(btnRun, "Runs RansomwareChecker.ps1 again (read-only, nothing is changed on the system).");
+            btnHtml = new AccentButton { Text = "HTML report", Secondary = true, Margin = new Padding(0, 0, 8, 0) };
+            btnHtml.Click += delegate { OpenPath(report == null ? null : Path.Combine(report.Folder, "report.html")); };
+            tips.SetToolTip(btnHtml, "Opens report.html of the shown report in the browser.");
+            btnFolder = new AccentButton { Text = "Report folder", Secondary = true, Margin = new Padding(0, 0, 8, 0) };
+            btnFolder.Click += delegate { OpenPath(report == null ? reportsDir : report.Folder); };
+            tips.SetToolTip(btnFolder, "Opens the folder with report.html, findings.csv and findings.json.");
+            btnFix = new AccentButton { Text = "Remediation plan", Secondary = true, Margin = new Padding(0, 0, 8, 0) };
+            btnFix.Click += delegate { OpenPath(RemediationFile()); };
+            tips.SetToolTip(btnFix, "Opens the recommended remediation plan of the shown report (Remediation folder next to Reports).");
+            buttons.Controls.Add(btnRun);
+            buttons.Controls.Add(btnFix);
+            buttons.Controls.Add(btnHtml);
+            buttons.Controls.Add(btnFolder);
+            var version = new Label { Dock = DockStyle.Right, AutoSize = true, Text = "v. " + App.Version + "  //  read-only",
+                ForeColor = Theme.Muted, Font = AppFonts.Regular(10.5F), Padding = new Padding(0, 9, 0, 0) };
+            toolbar.Controls.Add(version);
+            toolbar.Controls.Add(buttons);
+
+            // Status card
+            var hero = new Card { Dock = DockStyle.Top, Height = 128 };
+            statusIcon = new StatusIcon { Dock = DockStyle.Left, Width = 84 };
+            var heroText = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Card, Padding = new Padding(12, 4, 0, 0) };
+            lblHeadline = new Label { Dock = DockStyle.Top, Height = 56, TextAlign = ContentAlignment.MiddleLeft,
+                Font = AppFonts.Semibold(22F), ForeColor = Theme.Bright, BackColor = Theme.Card, AutoEllipsis = true };
+            lblSub = new Label { Dock = DockStyle.Top, Height = 30, TextAlign = ContentAlignment.TopLeft,
+                ForeColor = Theme.Muted, BackColor = Theme.Card, AutoEllipsis = true };
+            // Heights follow the font (Oswald has a tall line height; fixed pixels would clip it at higher DPI)
+            lblHeadline.Height = lblHeadline.Font.Height + 10;
+            lblSub.Height = Font.Height + 6;
+            hero.Height = Math.Max(128, hero.Padding.Vertical + heroText.Padding.Vertical + lblHeadline.Height + lblSub.Height + 6);
+            heroText.Controls.Add(lblSub);
+            heroText.Controls.Add(lblHeadline);
+            hero.Controls.Add(heroText);
+            hero.Controls.Add(statusIcon);
+
+            // Content card: title, filter bar (severity chips + search), list of findings
+            var content = new Card { Dock = DockStyle.Fill, Padding = new Padding(16, 12, 6, 10) };
+            lblListTitle = new Label { Dock = DockStyle.Top, Height = 32, TextAlign = ContentAlignment.TopLeft,
+                Font = AppFonts.Semibold(12.5F), ForeColor = Theme.Text, BackColor = Theme.Card, Padding = new Padding(4, 0, 0, 0) };
+            lblListTitle.Height = lblListTitle.Font.Height + 10;
+            var filterBar = new Panel { Dock = DockStyle.Top, Height = 48, BackColor = Theme.Card, Padding = new Padding(4, 0, 10, 8) };
+            var chipPanel = new FlowLayoutPanel { Dock = DockStyle.Left, AutoSize = true, WrapContents = false, BackColor = Theme.Card };
+            foreach (var sev in Severities)
+            {
+                var chip = new SeverityChip(sev);
+                chip.Toggled += delegate { ApplyFilter(); };
+                tips.SetToolTip(chip, "Show / hide " + sev + " findings");
+                chips.Add(chip);
+                chipPanel.Controls.Add(chip);
+            }
+            search = new TextBox { Dock = DockStyle.Fill, BorderStyle = BorderStyle.None,
+                BackColor = Theme.Input, ForeColor = Theme.Text, Font = new Font("Consolas", 10.5F) };
+            search.TextChanged += delegate { ApplyFilter(); };
+            search.HandleCreated += delegate { SendMessage(search.Handle, 0x1501, (IntPtr)1, "Search..."); };
+            // TextBox inside a 1 px green frame (the native border cannot be colored)
+            var searchWrap = new Panel { Dock = DockStyle.Right, Width = 320, BackColor = Theme.Card, Padding = new Padding(0, 4, 0, 0) };
+            var frame = new Panel { Dock = DockStyle.Top, Height = search.PreferredHeight + 12, BackColor = Theme.Border, Padding = new Padding(1) };
+            var inner = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Input, Padding = new Padding(8, 5, 6, 0) };
+            inner.Controls.Add(search);
+            frame.Controls.Add(inner);
+            searchWrap.Controls.Add(frame);
+            filterBar.Controls.Add(chipPanel);
+            filterBar.Controls.Add(searchWrap);
+            list = new FindingList { Dock = DockStyle.Fill };
+            content.Controls.Add(list);
+            content.Controls.Add(new Panel { Dock = DockStyle.Top, Height = 1, BackColor = Theme.Border });
+            content.Controls.Add(filterBar);
+            content.Controls.Add(lblListTitle);
+
+            // Footer: coverage notes (click for the list) | report path
+            var footerFont = AppFonts.Regular(10F);
+            var footer = new Panel { Dock = DockStyle.Bottom, Height = footerFont.Height + 12, BackColor = Theme.Back };
+            lblNotes = new Label { Dock = DockStyle.Left, AutoSize = true, Padding = new Padding(0, 6, 12, 0),
+                ForeColor = Theme.Muted, Font = footerFont, Cursor = Cursors.Hand };
+            lblNotes.Click += delegate { ShowNotes(); };
+            tips.SetToolTip(lblNotes, "Checks that were skipped or incomplete - click for details");
+            lblReport = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight, AutoEllipsis = true,
+                ForeColor = Theme.Muted, Font = footerFont };
+            footer.Controls.Add(lblReport);
+            footer.Controls.Add(lblNotes);
+
+            Controls.Add(content);
+            Controls.Add(new Panel { Dock = DockStyle.Top, Height = 14, BackColor = Theme.Back });
+            Controls.Add(hero);
+            Controls.Add(new Panel { Dock = DockStyle.Top, Height = 14, BackColor = Theme.Back });
+            Controls.Add(toolbar);
+            Controls.Add(footer);
+            ResumeLayout(true);
+        }
+
+        [DllImport("dwmapi.dll")]
+        static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+        [DllImport("user32.dll")]
+        static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+
+        void ApplyTitleBarTheme()
+        {
+            if (!IsHandleCreated) return;
+            int dark = 1;   // the app is always dark
+            try
+            {
+                DwmSetWindowAttribute(Handle, 20, ref dark, 4);
+                SetWindowPos(Handle, IntPtr.Zero, 0, 0, 0, 0, 0x0002 | 0x0001 | 0x0004 | 0x0020);
+            }
+            catch { }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            ApplyTitleBarTheme();
+        }
+
+        // Remediation plan written by the script next to the Reports folder: Remediation\<report folder name>\remediation.html
+        string RemediationFile()
+        {
+            if (report == null) return null;
+            try
+            {
+                string parent = Path.GetDirectoryName(report.Folder.TrimEnd('\\'));
+                string root = parent != null ? Path.GetDirectoryName(parent) : null;
+                if (root == null) return null;
+                string file = Path.Combine(Path.Combine(Path.Combine(root, "Remediation"), Path.GetFileName(report.Folder.TrimEnd('\\'))), "remediation.html");
+                return File.Exists(file) ? file : null;
+            }
+            catch { return null; }
+        }
+
+        static void OpenPath(string path)
+        {
+            if (string.IsNullOrEmpty(path) || !(File.Exists(path) || Directory.Exists(path)))
+            {
+                MessageBox.Show("Nothing to open yet - run a check first.", App.Name, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            try { Process.Start(new ProcessStartInfo(path) { UseShellExecute = true }); }
+            catch (Exception ex) { MessageBox.Show(ex.Message, App.Name, MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        }
+
+        void ShowNotes()
+        {
+            if (report == null || report.Notes.Count == 0) return;
+            MessageBox.Show("Coverage notes (skipped or incomplete checks):\r\n\r\n- " + string.Join("\r\n- ", report.Notes.ToArray()),
+                App.Name, MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        // ---------- State -> UI ----------
+
+        void RefreshAll()
+        {
+            foreach (var c in chips) c.Count = report == null ? 0 : report.Count(c.Severity);
+            UpdateHero();
+            ApplyFilter();
+            btnRun.Text = running ? "Stop check" : "Run check again";
+            btnHtml.Enabled = report != null;
+            btnFix.Enabled = RemediationFile() != null;
+            btnFolder.Enabled = true;
+            lblNotes.Text = report == null ? "" : (report.Notes.Count == 0 ? "Coverage: all checks completed" : "Coverage notes: " + report.Notes.Count + " (click)");
+            lblNotes.ForeColor = report != null && report.Notes.Count > 0 ? Theme.Warn : Theme.Muted;
+            lblReport.Text = report == null ? "No report yet" : "Report: " + report.Folder;
+        }
+
+        void UpdateHero()
+        {
+            if (running)
+            {
+                statusIcon.State = RunState.Running;
+                var el = DateTime.Now - runStarted;
+                lblHeadline.Text = "> CHECKING THE SYSTEM_";
+                lblSub.Text = string.Format("Check {0} of {1} done  ·  {2:0}:{3:00} elapsed{4}", checksDone, checksTotal,
+                    Math.Floor(el.TotalMinutes), el.Seconds, lastCheckLine.Length > 0 ? "  ·  last: " + lastCheckLine : "");
+                return;
+            }
+            if (report == null)
+            {
+                statusIcon.State = runError != null ? RunState.Warning : RunState.None;
+                lblHeadline.Text = runError != null ? "> CHECK DID NOT FINISH" : "> NO CHECK HAS RUN YET";
+                lblSub.Text = runError ?? "Click \"Run check again\" to start the check.";
+                return;
+            }
+            int h = report.Count("High"), m = report.Count("Medium");
+            statusIcon.State = h > 0 ? RunState.Problem : m > 0 ? RunState.Warning : RunState.Ok;
+            lblHeadline.Text = "> " + (h > 0 ? h + (h == 1 ? " HIGH-SEVERITY FINDING" : " HIGH-SEVERITY FINDINGS")
+                             : m > 0 ? m + (m == 1 ? " MEDIUM-SEVERITY FINDING" : " MEDIUM-SEVERITY FINDINGS")
+                             : "NO HIGH OR MEDIUM FINDINGS");
+            string sub = string.Format("{0}  ·  {1}  ·  {2:0} s  ·  last {3} days{4}{5}",
+                report.Computer, report.ReportTime, report.Duration, report.WindowDays,
+                report.Elevated ? "" : "  ·  NOT elevated", report.Quick ? "  ·  quick" : "");
+            if (reportIsPrevious) sub = "Previous report  ·  " + sub;
+            if (runError != null) sub = runError + "  ·  showing " + sub;
+            lblSub.Text = sub;
+        }
+
+        void ApplyFilter()
+        {
+            if (list == null) return;
+            var shown = new List<Finding>();
+            int total = report == null ? 0 : report.Findings.Count;
+            if (report != null)
+            {
+                var on = new HashSet<string>();
+                foreach (var c in chips) if (c.On) on.Add(c.Severity);
+                string q = search == null ? "" : search.Text.Trim();
+                foreach (var f in report.Findings)
+                {
+                    if (!on.Contains(f.Severity)) continue;
+                    if (q.Length > 0 && !(Has(f.Item, q) || Has(f.Category, q) || Has(f.Details, q) || Has(f.Mitre, q) || Has(f.Severity, q))) continue;
+                    shown.Add(f);
+                }
+            }
+            list.EmptyText = report == null ? (running ? "The check is running - results appear when it finishes." : "No report yet.")
+                           : total == 0 ? "No findings - nothing suspicious was found." : "No findings match the filter.";
+            list.SetItems(shown);
+            lblListTitle.Text = "// FINDINGS" + (report == null ? "" : "  (" + shown.Count + (shown.Count == total ? "" : " of " + total) + ")")
+                              + "   ·   click a row for details, right-click to copy";
+        }
+
+        static bool Has(string s, string q)
+        {
+            return s != null && s.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        // ---------- Reports ----------
+
+        void LoadLatestReport()
+        {
+            try
+            {
+                if (!Directory.Exists(reportsDir)) return;
+                DirectoryInfo best = null;
+                foreach (var d in new DirectoryInfo(reportsDir).GetDirectories())
+                    if (File.Exists(Path.Combine(d.FullName, "findings.json")) && (best == null || d.CreationTime > best.CreationTime)) best = d;
+                if (best != null) { report = Report.Load(best.FullName); reportIsPrevious = true; }
+            }
+            catch { report = null; }
+        }
+
+        // ---------- Running the script ----------
+
+        static string PowerShellPath()
+        {
+            // 32-bit process on 64-bit Windows would get the redirected System32; use sysnative there
+            string win = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            string sysDir = Environment.Is64BitOperatingSystem && !Environment.Is64BitProcess ? Path.Combine(win, "Sysnative") : Path.Combine(win, "System32");
+            return Path.Combine(sysDir, @"WindowsPowerShell\v1.0\powershell.exe");
+        }
+
+        void StartRun()
+        {
+            if (running) return;
+            if (!File.Exists(scriptPath))
+            {
+                runError = "RansomwareChecker.ps1 was not found next to the exe (" + appDir + ").";
+                RefreshAll();
+                return;
+            }
+            running = true;
+            cancelled = false;
+            runError = null;
+            checksDone = 0;
+            checksTotal = quick ? 19 : 21;
+            lastCheckLine = "";
+            runStarted = DateTime.Now;
+            RefreshAll();
+            var t = new Thread(RunWorker) { IsBackground = true };
+            t.Start();
+        }
+
+        void StopRun()
+        {
+            if (!running) return;
+            if (MessageBox.Show("Stop the running check? No report will be produced.", App.Name, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            cancelled = true;
+            var p = proc;
+            if (p != null) try { if (!p.HasExited) p.Kill(); } catch { }
+        }
+
+        void RunWorker()
+        {
+            string error = null;
+            string folder = null;
+            var errText = new StringBuilder();
+            try
+            {
+                string args = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + scriptPath + "\" -DaysBack " + daysBack
+                              + (quick ? " -Quick" : "") + " -OutputPath \"" + reportsDir.TrimEnd('\\') + "\"";
+                var psi = new ProcessStartInfo(PowerShellPath(), args)
+                {
+                    UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = appDir,
+                    RedirectStandardOutput = true, RedirectStandardError = true
+                };
+                using (var p = new Process { StartInfo = psi })
+                {
+                    p.OutputDataReceived += (s, e) =>
+                    {
+                        if (e.Data == null) return;
+                        string line = e.Data.Trim();
+                        if (!line.StartsWith("[*]")) return;
+                        checksDone++;
+                        // "[*] Run / RunOnce keys      10 findings (High 0, Medium 0)  0.2s" -> "Run / RunOnce keys - 10 findings"
+                        string name = line.Substring(3).Trim();
+                        int cut = name.IndexOf("  ", StringComparison.Ordinal);
+                        string rest = cut > 0 ? name.Substring(cut).Trim() : "";
+                        if (cut > 0) name = name.Substring(0, cut);
+                        int paren = rest.IndexOf(" (", StringComparison.Ordinal);
+                        lastCheckLine = name + (rest.Length > 0 ? " - " + (paren > 0 ? rest.Substring(0, paren) : rest) : "");
+                        try { BeginInvoke((Action)UpdateHero); } catch { }
+                    };
+                    p.ErrorDataReceived += (s, e) => { if (e.Data != null) lock (errText) errText.AppendLine(e.Data); };
+                    p.Start();
+                    proc = p;
+                    p.BeginOutputReadLine();
+                    p.BeginErrorReadLine();
+                    p.WaitForExit();
+                    proc = null;
+                    if (cancelled) error = "The check was stopped.";
+                    else
+                    {
+                        // The script writes Reports\<PC>_<time>; take the newest folder created by this run
+                        DirectoryInfo best = null;
+                        if (Directory.Exists(reportsDir))
+                            foreach (var d in new DirectoryInfo(reportsDir).GetDirectories())
+                                if (d.CreationTime >= runStarted.AddSeconds(-5) && File.Exists(Path.Combine(d.FullName, "findings.json"))
+                                    && (best == null || d.CreationTime > best.CreationTime)) best = d;
+                        if (best != null) folder = best.FullName;
+                        else
+                        {
+                            string err = errText.ToString().Trim();
+                            error = "The script did not produce a report (exit code " + p.ExitCode + ")" + (err.Length > 0 ? ": " + FirstLine(err) : ".");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { error = "Cannot run PowerShell: " + ex.Message; }
+
+            Report loaded = null;
+            if (folder != null)
+            {
+                try { loaded = Report.Load(folder); }
+                catch (Exception ex) { error = "Cannot read the report: " + ex.Message; }
+            }
+            try
+            {
+                BeginInvoke((Action)delegate
+                {
+                    running = false;
+                    runError = error;
+                    if (loaded != null) { report = loaded; reportIsPrevious = false; }
+                    RefreshAll();
+                    if (loaded != null && !Focused && WindowState == FormWindowState.Minimized) FlashTitle();
+                });
+            }
+            catch { }
+        }
+
+        static string FirstLine(string s)
+        {
+            int i = s.IndexOfAny(new[] { '\r', '\n' });
+            return i > 0 ? s.Substring(0, i) : s;
+        }
+
+        void FlashTitle()
+        {
+            Text = App.Name + " - check finished";
+        }
+    }
+}
