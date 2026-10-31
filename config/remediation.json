@@ -64,6 +64,15 @@
       "Legitimate vendor services in unusual locations: verify with the vendor before removal."
     ]
   },
+  "Defense evasion: Kernel drivers (BYOVD)": {
+    "Steps": [
+      "Preserve the driver file and its service key (HKLM\\SYSTEM\\CurrentControlSet\\Services\\<name>) and hash the .sys file; look it up on loldrivers.io and VirusTotal.",
+      "Check event 7045 / System log for when and by whom the driver service was created; correlate with EDR/AV stopping at the same time.",
+      "Verify that the EDR/AV is running and healthy on this and other hosts - BYOVD is used to kill security tools right before deployment.",
+      "Disable and delete the driver service, reboot and remove the .sys file during eradication.",
+      "Enable the Microsoft vulnerable driver blocklist (Windows Security > Device security > Core isolation, or WDAC) and HVCI/Memory integrity where possible."
+    ]
+  },
   "Persistence: WMI subscriptions": {
     "Steps": [
       "Export filter, consumer and binding (Get-CimInstance -Namespace root\\subscription ...) for evidence.",

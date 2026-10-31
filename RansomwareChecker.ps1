@@ -49,7 +49,7 @@ param(
 $ErrorActionPreference = 'Continue'
 $ProgressPreference    = 'SilentlyContinue'
 
-$script:Version   = '1.0.0'
+$script:Version   = '1.1.0'
 $script:Root      = $PSScriptRoot
 $script:Since     = (Get-Date).AddDays(-$DaysBack)
 $script:Findings  = New-Object System.Collections.Generic.List[object]
@@ -65,8 +65,10 @@ if (-not (Test-Path -LiteralPath $configPath)) {
     exit 10
 }
 $script:Ioc = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+# Patterns come from an editable file and are applied to attacker-controlled text -> bounded run time (ReDoS)
+$script:RegexTimeout = [TimeSpan]::FromMilliseconds(500)
 $script:KeywordRegex = @($script:Ioc.CommandKeywords | ForEach-Object {
-    New-Object System.Text.RegularExpressions.Regex($_, 'IgnoreCase')
+    New-Object System.Text.RegularExpressions.Regex($_, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase, $script:RegexTimeout)
 })
 
 #region ---------------------------------------------------------------- helpers
@@ -113,25 +115,60 @@ function Test-PrivateAddress {
     param([string]$Ip)
     if ([string]::IsNullOrWhiteSpace($Ip) -or $Ip -in @('-', '::1', '127.0.0.1', 'LOCAL', '0.0.0.0', '::')) { return $true }
     $Ip = $Ip -replace '^::ffff:', ''
-    return ($Ip -match '^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.|169\.254\.|fe80:|fc|fd)')
+    # RFC1918, loopback, link-local (169.254/16, fe80::/10), CGNAT 100.64/10, unique local fc00::/7
+    return ($Ip -match '^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.|169\.254\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|fe[89ab][0-9a-f]:|f[cd][0-9a-f]{0,2}:)')
 }
 
 function Find-Keywords {
     param([string]$Text)
     if ([string]::IsNullOrEmpty($Text)) { return @() }
-    $hits = foreach ($rx in $script:KeywordRegex) { if ($rx.IsMatch($Text)) { $rx.ToString() } }
+    $hits = foreach ($rx in $script:KeywordRegex) {
+        try { if ($rx.IsMatch($Text)) { $rx.ToString() } }
+        catch [System.Text.RegularExpressions.RegexMatchTimeoutException] {
+            if (-not $script:RegexTimeoutNoted) { $script:RegexTimeoutNoted = $true; Add-Note 'Keywords' "Pattern '$rx' timed out on a long text - that text was not fully evaluated" }
+        }
+    }
     return @($hits)
 }
 
+function Get-SidName {
+    param([string]$Sid)
+    try { return (New-Object Security.Principal.SecurityIdentifier $Sid).Translate([Security.Principal.NTAccount]).Value } catch { return $Sid }
+}
+
+# local / domain accounts (S-1-5-21-...) and Entra ID accounts (S-1-12-1-...)
+$script:UserSidPattern = '^S-1-(5-21|12-1)-[\d-]+$'
+
 function Get-UserHives {
+    # Only hives of logged-on users are mounted under HKEY_USERS; see Get-UnloadedProfiles for the rest
     Get-ChildItem -Path 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue |
-        Where-Object { $_.PSChildName -match '^S-1-5-21-[\d-]+$' } |
+        Where-Object { $_.PSChildName -match $script:UserSidPattern } |
         ForEach-Object {
             $sid = $_.PSChildName
-            $name = $sid
-            try { $name = (New-Object Security.Principal.SecurityIdentifier $sid).Translate([Security.Principal.NTAccount]).Value } catch { }
-            [pscustomobject]@{ Sid = $sid; Name = $name; Root = "Registry::HKEY_USERS\$sid" }
+            [pscustomobject]@{ Sid = $sid; Name = (Get-SidName $sid); Root = "Registry::HKEY_USERS\$sid" }
         }
+}
+
+function Get-UnloadedProfiles {
+    # Profiles whose NTUSER.DAT is not loaded (user logged off) - their HKCU is not checked.
+    # Typically an account created by the attacker. Loading the hive would change the system, so it is only reported.
+    $loaded = @(Get-UserHives | ForEach-Object { $_.Sid })
+    Get-ChildItem -LiteralPath 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSChildName -match $script:UserSidPattern -and $loaded -notcontains $_.PSChildName } |
+        ForEach-Object {
+            [pscustomobject]@{ Sid = $_.PSChildName; Name = (Get-SidName $_.PSChildName); Path = [string]$_.GetValue('ProfileImagePath') }
+        }
+}
+
+function Test-OwnFile {
+    # Files of this tool (and its output) - excluded from file system sweeps. Exact names, so that running
+    # from a drive root (e.g. a USB stick E:\) does not exclude the whole drive.
+    param([string]$Path)
+    $root = $script:Root.TrimEnd('\') + '\'
+    if (-not $Path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    $rel = $Path.Substring($root.Length)
+    if ($rel -match '^(?i)(Reports|Remediation|config|src|licenses|cert)\\') { return $true }
+    return ($rel -match '^(?i)(RansomwareChecker\.(ps1|exe|ini)|Run-RansomwareChecker\.bat|README\.md|LICENSE)$')
 }
 
 function Get-UserProfileDirs {
@@ -185,20 +222,30 @@ function Get-SignatureInfo {
 }
 
 function Test-NameList {
-    # Matches tool names at a path / argument boundary, e.g. "\adfind.exe", " rclone ", "=mimikatz"
+    # Matches tool names at a path / argument boundary, e.g. "\adfind.exe", " rclone ", "=mimikatz";
+    # the name must also end there ("adfind_report.txt", "adfinder" do not match "adfind")
     param([string]$Text, $Names)
     foreach ($n in $Names) {
-        $pattern = '(^|[\\/\s"'',=(])' + [regex]::Escape($n.ToLowerInvariant())
+        $pattern = '(^|[\\/\s"'',=(])' + [regex]::Escape($n.ToLowerInvariant()) + '(?![a-z_])'
         if ($Text -match $pattern) { return $n }
     }
     return $null
 }
 
 function Get-CommandAssessment {
+    # Never throws: one malformed (attacker-controlled) value must not abort the whole check
+    param([string]$Command, [switch]$CheckSignature)
+    try { return (Get-CommandAssessmentCore -Command $Command -CheckSignature:$CheckSignature) }
+    catch {
+        return [pscustomobject]@{ Level = 1; Behaviour = 0; Location = 1; Reasons = @("could not be assessed: $($_.Exception.Message)"); Paths = @() }
+    }
+}
+
+function Get-CommandAssessmentCore {
     <#
         Scores a command line / path. Levels: 0 Info, 1 Low, 2 Medium, 3 High.
         "Behaviour" reasons (tool names, encoded PowerShell, masquerading...) cannot be
-        downgraded; "location" reasons are downgraded to Low when the file has a valid signature.
+        downgraded; "location" reasons are downgraded to Low only when every flagged file has a valid signature.
     #>
     param([string]$Command, [switch]$CheckSignature)
 
@@ -219,9 +266,11 @@ function Get-CommandAssessment {
     }
 
     if ($c -match '(powershell|pwsh)') {
-        if ($c -match '\s[-/](e|ec|enc\w*)\s') {
+        # any prefix of -EncodedCommand (-e, -en, -enc ...) or -ec; PowerShell also accepts dashes U+2013..U+2015 instead of '-'
+        $encSwitch = '\s[-/\u2013\u2014\u2015](?:ec|e|en\w*)'
+        if ($c -match ($encSwitch + '\s')) {
             $reasons.Add('encoded PowerShell'); $behaviour = 3
-            $b64 = [regex]::Match($Command, '(?i)\s[-/](?:e|ec|enc\w*)\s+"?([A-Za-z0-9+/=]{16,})')
+            $b64 = [regex]::Match($Command, '(?i)' + $encSwitch + '\s+"?([A-Za-z0-9+/=]{16,})')
             if ($b64.Success) {
                 try {
                     $decoded = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($b64.Groups[1].Value)) -replace '\s+', ' '
@@ -240,7 +289,8 @@ function Get-CommandAssessment {
     if ($c -match '(%comspec%|cmd(\.exe)?"?\s+/[ckr]\b).*(powershell|\\\\|rundll32|start\s+/b)') {
         $reasons.Add('cmd.exe wrapper launching payload'); $behaviour = [Math]::Max($behaviour, 2)
     }
-    if ($c -match 'comsvcs(\.dll)?["'',\s]+#?\s*mini?dump') { $reasons.Add('LSASS dump via comsvcs.dll'); $behaviour = 3 }
+    # MiniDump is export #24 of comsvcs.dll - "comsvcs.dll, #24" / "#+24" / "#0024" are the usual evasions
+    if ($c -match 'comsvcs(\.dll)?["'',\s]+(#?\s*mini?dump|#\s*\+?0*24\b)') { $reasons.Add('LSASS dump via comsvcs.dll'); $behaviour = 3 }
     if ($c -match '\bmshta(\.exe)?\b') { $reasons.Add('mshta'); $behaviour = [Math]::Max($behaviour, 2) }
     if ($c -match 'certutil.*(-decode|-urlcache)') { $reasons.Add('certutil decode/download'); $behaviour = 3 }
     if ($c -match 'bitsadmin.*/transfer') { $reasons.Add('bitsadmin transfer'); $behaviour = 3 }
@@ -249,14 +299,15 @@ function Get-CommandAssessment {
     $m = [regex]::Match($c, 'rundll32(\.exe)?"?\s+"?([^",]+?)"?\s*,')
     if ($m.Success) {
         $arg = $m.Groups[2].Value.Trim()
-        $ext = [IO.Path]::GetExtension($arg)
+        # regex instead of [IO.Path]::GetExtension - that throws on | < > " in PowerShell 5.1
+        $ext = [regex]::Match($arg, '\.[^.\\/]*$').Value
         if ($ext -and $ext -notin @('.dll', '.cpl', '.ocx', '.drv')) {
             $reasons.Add("rundll32 loads non-DLL file '$arg'"); $behaviour = 3
         }
     }
 
     $paths = Get-PathCandidates $Command
-    $flaggedPath = $null
+    $flaggedPaths = New-Object System.Collections.Generic.List[string]
     foreach ($p in $paths) {
         $pl = $p.ToLowerInvariant()
         $allowed = $false
@@ -264,19 +315,20 @@ function Get-CommandAssessment {
         if (-not $allowed) {
             $matched = $false
             foreach ($s in $script:Ioc.SuspiciousPathPatterns) {
-                if ($pl -match $s) { $reasons.Add("suspicious location"); $location = [Math]::Max($location, 2); $flaggedPath = $p; $matched = $true; break }
+                if ($pl -match $s) { $reasons.Add("suspicious location"); $location = [Math]::Max($location, 2); $flaggedPaths.Add($p); $matched = $true; break }
             }
             if (-not $matched) {
                 foreach ($s in $script:Ioc.UnusualPathPatterns) {
-                    if ($pl -match $s) { $reasons.Add("user-writable location"); $location = [Math]::Max($location, 1); if (-not $flaggedPath) { $flaggedPath = $p }; break }
+                    if ($pl -match $s) { $reasons.Add("user-writable location"); $location = [Math]::Max($location, 1); $flaggedPaths.Add($p); break }
                 }
             }
         }
         try {
             $leaf = [IO.Path]::GetFileName($pl)
             $dir  = [IO.Path]::GetDirectoryName($pl)
+            # anchored: C:\ProgramData\Windows\System32\svchost.exe is NOT the real one
             if ($script:Ioc.SystemBinaryNames -contains $leaf -and $dir -and
-                $dir -notmatch '\\windows\\(system32|syswow64|winsxs|servicing)' -and
+                $dir -notmatch '^[a-z]:\\windows\\(system32|syswow64|winsxs|servicing)(\\|$)' -and
                 -not ($leaf -eq 'explorer.exe' -and $dir -match '^[a-z]:\\windows$') -and
                 -not ($leaf -eq 'msedgeupdater.exe')) {
                 $reasons.Add("system binary name outside System32 (masquerading): $p"); $behaviour = 3
@@ -292,14 +344,19 @@ function Get-CommandAssessment {
         } catch { }
     }
 
-    if ($CheckSignature -and $flaggedPath -and $location -ge 1 -and $behaviour -lt 2) {
-        $exists = $false
-        try { $exists = Test-Path -LiteralPath $flaggedPath -PathType Leaf -ErrorAction SilentlyContinue } catch { }
-        if ($exists) {
-            $sig = Get-SignatureInfo $flaggedPath
-            if ($sig.Valid) { $reasons.Add("signed: $($sig.Signer)"); $location = [Math]::Min($location, 1) }
-            else { $reasons.Add('unsigned') }
+    # Downgrade only when EVERY flagged file exists and is signed - otherwise "evil.exe signed.exe"
+    # would be downgraded because of the signed argument
+    if ($CheckSignature -and $flaggedPaths.Count -gt 0 -and $location -ge 1 -and $behaviour -lt 2) {
+        $allSigned = $true
+        $signers = New-Object System.Collections.Generic.List[string]
+        foreach ($fp in ($flaggedPaths | Select-Object -Unique)) {
+            $exists = $false
+            try { $exists = Test-Path -LiteralPath $fp -PathType Leaf -ErrorAction SilentlyContinue } catch { }
+            if (-not $exists) { $allSigned = $false; continue }
+            $sig = Get-SignatureInfo $fp
+            if ($sig.Valid) { $signers.Add($sig.Signer) } else { $allSigned = $false; $reasons.Add("unsigned: $fp") }
         }
+        if ($allSigned) { $reasons.Add("signed: $(($signers | Select-Object -Unique) -join ', ')"); $location = [Math]::Min($location, 1) }
     }
 
     return [pscustomobject]@{
@@ -314,9 +371,15 @@ function Get-CommandAssessment {
 function Get-EventsXPath {
     param([string]$LogName, [string]$XPath, [int]$Max = 5000)
     try {
-        return @(Get-WinEvent -LogName $LogName -FilterXPath $XPath -MaxEvents $Max -ErrorAction Stop)
+        $events = @(Get-WinEvent -LogName $LogName -FilterXPath $XPath -MaxEvents $Max -ErrorAction Stop)
+        if ($events.Count -ge $Max) {
+            $ids = ([regex]::Matches($XPath, 'EventID=(\d+)') | ForEach-Object { $_.Groups[1].Value }) -join ', '
+            Add-Note "EventLog $LogName" "Limit of $Max events reached (ID $ids) - older events in the window were not evaluated"
+        }
+        return $events
     } catch {
-        if ($_.Exception.Message -notmatch 'No events were found|Nebyly nalezeny|Es wurden keine') {
+        # empty result is an error in Get-WinEvent; the message is localized, the error id is not
+        if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') {
             Add-Note "EventLog $LogName" $_.Exception.Message
         }
         return @()
@@ -370,6 +433,30 @@ function ConvertFrom-Rot13 {
         else { $ch }
     }
     return -join $chars
+}
+
+function Get-VolumeDeviceMap {
+    # "\Device\HarddiskVolume3" -> "C:" for every drive letter (QueryDosDevice), used to translate BAM paths
+    $map = @{}
+    try {
+        if (-not ('RcNative.Dos' -as [type])) {
+            Add-Type -Namespace RcNative -Name Dos -ErrorAction Stop -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+public static extern uint QueryDosDevice(string lpDeviceName, System.Text.StringBuilder lpTargetPath, int ucchMax);
+'@
+        }
+        foreach ($d in [IO.DriveInfo]::GetDrives()) {
+            $letter = $d.Name.Substring(0, 2)
+            $sb = New-Object System.Text.StringBuilder 1024
+            if ([RcNative.Dos]::QueryDosDevice($letter, $sb, $sb.Capacity) -gt 0) { $map[$sb.ToString()] = $letter }
+        }
+    } catch { }
+    return $map
+}
+
+function Get-FixedDrives {
+    # Local fixed drives (C:\, D:\ ...) - on file servers the data and the ransom notes are usually not on C:
+    @([IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady } | ForEach-Object { $_.RootDirectory.FullName })
 }
 
 #endregion
@@ -522,6 +609,44 @@ function Test-Services {
     }
 }
 
+function Test-Drivers {
+    # Bring Your Own Vulnerable Driver: a signed but vulnerable driver is loaded to kill EDR/AV from the kernel
+    # (RTCore64 - BlackByte/AvosLocker, aswArPot - Cuba/AvosLocker, gdrv - RobbinHood, zam64 - Terminator ...)
+    $cat = 'Defense evasion: Kernel drivers (BYOVD)'
+    $vuln = @($script:Ioc.VulnerableDrivers | ForEach-Object { ($_ -replace '\.sys$', '').ToLowerInvariant() })
+    foreach ($d in Get-CimInstance -ClassName Win32_SystemDriver -ErrorAction Stop) {
+        $path = Convert-ImagePath $d.PathName
+        if (-not $path) { continue }
+        $pl = $path.ToLowerInvariant()
+        $base = [regex]::Match($pl, '([^\\]+?)(\.sys)?$').Groups[1].Value
+        $lvl = 0
+        $reasons = New-Object System.Collections.Generic.List[string]
+        if ($vuln -contains $base) {
+            $lvl = if ($d.State -eq 'Running') { 3 } else { 2 }
+            $reasons.Add("known vulnerable / abused driver '$base.sys' (see loldrivers.io)")
+        }
+        # System32 / SysWOW64 are writable only by TrustedInstaller/admins; vulnerable drivers there are caught by name
+        $standard = $pl -match '^[a-z]:\\windows\\(system32|syswow64)\\'
+        if (-not $standard) {
+            $a = Get-CommandAssessment -Command "`"$path`""
+            foreach ($r in $a.Reasons) { $reasons.Add($r) }
+            $lvl = [Math]::Max($lvl, [Math]::Max($a.Level, 1))
+            $reasons.Add('driver outside System32')
+            $exists = $false
+            try { $exists = Test-Path -LiteralPath $path -PathType Leaf -ErrorAction SilentlyContinue } catch { }
+            if ($exists) {
+                $sig = Get-SignatureInfo $path
+                if (-not $sig.Valid) { $lvl = [Math]::Max($lvl, $(if ($d.State -eq 'Running') { 3 } else { 2 })); $reasons.Add('driver not validly signed') }
+                $fi = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+                if ($fi -and $fi.CreationTime -ge $script:Since) { $lvl = [Math]::Max($lvl, 2); $reasons.Add('driver file created within window') }
+            }
+        }
+        if ($lvl -lt 1) { continue }
+        $details = Join-Details ("{0}  (State: {1}; Start: {2})" -f $path, $d.State, $d.StartMode) $reasons
+        Add-Finding -Category $cat -Level $lvl -Item "$($d.Name) ($($d.DisplayName))" -Details $details -Mitre 'T1068 / T1562.001'
+    }
+}
+
 function Test-WmiPersistence {
     $cat = 'Persistence: WMI subscriptions'
     $consumers = @(Get-CimInstance -Namespace 'root\subscription' -ClassName '__EventConsumer' -ErrorAction Stop)
@@ -529,7 +654,8 @@ function Test-WmiPersistence {
     $filters   = @(Get-CimInstance -Namespace 'root\subscription' -ClassName '__EventFilter' -ErrorAction SilentlyContinue)
     foreach ($c in $consumers) {
         $cls = $c.CimClass.CimClassName
-        if ($c.Name -eq 'SCM Event Log Consumer') { continue }
+        # built-in consumer - skip by class AND name, a CommandLineEventConsumer can be given the same name
+        if ($cls -eq 'NTEventLogEventConsumer' -and $c.Name -eq 'SCM Event Log Consumer') { continue }
         $text = $cls
         $lvl = 1
         if ($cls -eq 'CommandLineEventConsumer')  { $text = ('{0} {1}' -f $c.ExecutablePath, $c.CommandLineTemplate).Trim(); $lvl = 3 }
@@ -574,7 +700,9 @@ function Test-RemoteAccessSoftware {
             if (-not $match) { return }
             $inst = $_.GetValue('InstallDate')
             $instDate = $null
-            if ($inst -match '^\d{8}$') { $instDate = [datetime]::ParseExact($inst, 'yyyyMMdd', $null) }
+            # user-writable (HKCU) value - an invalid date such as 20241399 must not abort the check
+            [datetime]$tmp = 0
+            if ([datetime]::TryParseExact([string]$inst, 'yyyyMMdd', [Globalization.CultureInfo]::InvariantCulture, 'None', [ref]$tmp)) { $instDate = $tmp }
             $lvl = 2
             $reasons = @("matches '$match'")
             if ($instDate -and $instDate -ge $script:Since.Date) { $lvl = 3; $reasons += 'installed within window' }
@@ -599,13 +727,17 @@ function Test-RunningProcesses {
     } catch { Add-Note 'Processes' "Get-NetTCPConnection failed: $($_.Exception.Message)" }
 
     $procs = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
-    # exclude this checker and the processes that launched it
-    $self = @{}
-    $cur = $PID
-    for ($i = 0; $i -lt 6 -and $cur; $i++) {
-        $self[[int]$cur] = $true
-        $parent = $procs | Where-Object { $_.ProcessId -eq $cur } | Select-Object -First 1
-        $cur = if ($parent) { $parent.ParentProcessId } else { $null }
+    # exclude this checker and the ancestors that belong to it (the app / the .bat) - not explorer.exe & co.
+    $self = @{ ([int]$PID) = $true }
+    $markers = @($PSCommandPath, (Join-Path $script:Root 'Run-RansomwareChecker.bat')) | Where-Object { $_ }
+    $cur = ($procs | Where-Object { $_.ProcessId -eq $PID } | Select-Object -First 1)
+    for ($i = 0; $i -lt 4 -and $cur; $i++) {
+        $cur = $procs | Where-Object { $_.ProcessId -eq $cur.ParentProcessId } | Select-Object -First 1
+        if (-not $cur) { break }
+        $own = ($cur.ExecutablePath -and (Test-OwnFile $cur.ExecutablePath))
+        foreach ($mk in $markers) { if ($cur.CommandLine -and $cur.CommandLine.IndexOf($mk, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $own = $true } }
+        if (-not $own) { break }
+        $self[[int]$cur.ProcessId] = $true
     }
     foreach ($p in $procs) {
         if ($self.ContainsKey([int]$p.ProcessId)) { continue }
@@ -664,7 +796,9 @@ function Test-SecurityConfiguration {
     }
 
     try {
-        foreach ($fp in Get-NetFirewallProfile -ErrorAction Stop) {
+        # ActiveStore = effective policy (local + GPO). Without it only the local PersistentStore is read and
+        # a firewall disabled by GPO (LockBit pattern) is missed.
+        foreach ($fp in Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop) {
             if (-not $fp.Enabled) { Add-Finding -Category $cat -Level 2 -Item "Windows Firewall disabled ($($fp.Name) profile)" -Mitre 'T1562.004' }
         }
     } catch { Add-Note 'Firewall' $_.Exception.Message }
@@ -700,8 +834,26 @@ function Test-Defender {
     if (-not (Get-Command Get-MpPreference -ErrorAction SilentlyContinue)) { Add-Note 'Defender' 'Defender cmdlets not available'; return }
     try {
         $st = Get-MpComputerStatus -ErrorAction Stop
-        if (-not $st.RealTimeProtectionEnabled) { Add-Finding -Category $cat -Level 3 -Item 'Real-time protection is OFF' -Details 'May also be caused by a third-party AV' -Mitre 'T1562.001' }
-        if (-not $st.AntivirusEnabled) { Add-Finding -Category $cat -Level 2 -Item 'Defender antivirus disabled' -Details 'Verify whether another AV is installed' -Mitre 'T1562.001' }
+        $mode = [string]$st.AMRunningMode
+        if ($mode -match '(?i)passive|edr block') {
+            # Defender intentionally passive next to another AV - real-time protection is off by design
+            # ...unless no other AV is registered (passive mode can also be forced via ForceDefenderPassiveMode)
+            $av = $null
+            try {
+                $av = @(Get-CimInstance -Namespace 'root\SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction Stop |
+                        Where-Object { $_.displayName -notmatch 'Windows Defender|Microsoft Defender' } | ForEach-Object { $_.displayName }) -join ', '
+            } catch { }   # Security Center does not exist on Windows Server
+            if ($null -eq $av) {
+                Add-Finding -Category $cat -Level 1 -Item "Defender in $mode" -Details 'Another antivirus should be primary - verify that it is installed, running and up to date.' -Mitre 'T1562.001'
+            } elseif ($av) {
+                Add-Finding -Category $cat -Level 0 -Item "Defender in $mode" -Details "Primary antivirus: $av" -Mitre 'T1562.001'
+            } else {
+                Add-Finding -Category $cat -Level 3 -Item "Defender in $mode, no other antivirus registered" -Details 'Real-time protection is off and nothing replaces it (ForceDefenderPassiveMode?)' -Mitre 'T1562.001'
+            }
+        } else {
+            if (-not $st.RealTimeProtectionEnabled) { Add-Finding -Category $cat -Level 3 -Item 'Real-time protection is OFF' -Details "Defender running mode: $mode" -Mitre 'T1562.001' }
+            if (-not $st.AntivirusEnabled) { Add-Finding -Category $cat -Level 2 -Item 'Defender antivirus disabled' -Details 'Verify whether another AV is installed' -Mitre 'T1562.001' }
+        }
         if ($st.IsTamperProtected -eq $false) { Add-Finding -Category $cat -Level 1 -Item 'Tamper protection off' -Mitre 'T1562.001' }
     } catch { Add-Note 'Defender' "Get-MpComputerStatus: $($_.Exception.Message)" }
     try {
@@ -824,8 +976,12 @@ function Test-EventLogs {
     $ms = [long]$DaysBack * 86400000
     $fails = Get-EventsXPath 'Security' "*[System[(EventID=4625) and TimeCreated[timediff(@SystemTime) <= $ms]]]" 50000
     if ($fails.Count -gt 0) {
-        $byIp = $fails | ForEach-Object { $d = Get-EventDataMap $_; [pscustomobject]@{ Ip = $d['IpAddress']; User = $d['TargetUserName']; Time = $_.TimeCreated } } |
-            Group-Object Ip
+        # up to 50 000 events: read the fixed 4625 layout (5 = TargetUserName, 19 = IpAddress) instead of ToXml()
+        $byIp = $fails | ForEach-Object {
+            $pr = $_.Properties
+            if ($pr.Count -gt 19) { [pscustomobject]@{ Ip = [string]$pr[19].Value; User = [string]$pr[5].Value; Time = $_.TimeCreated } }
+            else { $d = Get-EventDataMap $_; [pscustomobject]@{ Ip = $d['IpAddress']; User = $d['TargetUserName']; Time = $_.TimeCreated } }
+        } | Group-Object Ip
         foreach ($g in $byIp) {
             if ($g.Count -lt [int]$script:Ioc.BruteForceThreshold) { continue }
             $lvl = if (Test-PrivateAddress $g.Name) { 2 } else { 3 }
@@ -894,26 +1050,44 @@ function Test-EventLogs {
 
     # PowerShell
     $ownScript = $PSCommandPath
-    $seenBlocks = @{}
+    # this checker's own code: a block is skipped only if its text is literally part of this script file
+    # (a path or a magic word in a comment could be faked by an attacker)
+    $ownText = ''
+    try { $ownText = [IO.File]::ReadAllText($ownScript) -replace '\r', '' } catch { }
     $moduleDirs = '(?i)^(' + [regex]::Escape("$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules") + '|' +
                   [regex]::Escape("$env:ProgramFiles\WindowsPowerShell\Modules") + ')\\'
-    foreach ($e in Get-EventsXPath 'Microsoft-Windows-PowerShell/Operational' (Get-XPathWindow 4104) 5000) {
-        $d = Get-EventDataMap $e
+    # Large scripts are logged in several parts (MessageNumber/MessageTotal) with the same ScriptBlockId -
+    # join all parts first, then search for keywords (large attack tool scripts span dozens of parts)
+    $blocks = @{}
+    foreach ($e in Get-EventsXPath 'Microsoft-Windows-PowerShell/Operational' (Get-XPathWindow 4104) 20000) {
+        # fixed 4104 layout: 0 MessageNumber, 1 MessageTotal, 2 ScriptBlockText, 3 ScriptBlockId, 4 Path
+        $pr = $e.Properties
+        if ($pr.Count -ge 5) {
+            $d = @{ MessageNumber = $pr[0].Value; MessageTotal = $pr[1].Value; ScriptBlockText = $pr[2].Value; ScriptBlockId = $pr[3].Value; Path = $pr[4].Value }
+        } else { $d = Get-EventDataMap $e }
         $blockPath = [string]$d['Path']
-        if ($ownScript -and $blockPath -eq $ownScript) { continue }
         if ($blockPath -match $moduleDirs) { continue }              # built-in / installed modules (e.g. Defender cmdlets)
-        $text = [string]$d['ScriptBlockText']
-        if ($text.Contains('Get-CommandAssessment')) { continue }    # this checker's own code
-        $id = $d['ScriptBlockId']
-        if ($id -and $seenBlocks.ContainsKey($id)) { continue }
-        if ($id) { $seenBlocks[$id] = $true }
+        $id = [string]$d['ScriptBlockId']
+        if (-not $id) { $id = [guid]::NewGuid().ToString() }
+        $num = 1; [void][int]::TryParse([string]$d['MessageNumber'], [ref]$num)
+        if (-not $blocks.ContainsKey($id)) {
+            $blocks[$id] = [pscustomobject]@{ Path = $blockPath; Parts = @{}; Total = [string]$d['MessageTotal']; Time = $e.TimeCreated }
+        }
+        $b = $blocks[$id]
+        if (-not $b.Parts.ContainsKey($num)) { $b.Parts[$num] = [string]$d['ScriptBlockText'] }
+        if ($e.TimeCreated -lt $b.Time) { $b.Time = $e.TimeCreated }
+    }
+    foreach ($b in $blocks.Values) {
+        $text = -join ($b.Parts.Keys | Sort-Object | ForEach-Object { $b.Parts[$_] })
+        if ($ownText -and ($text -replace '\r', '').Length -gt 0 -and $ownText.Contains(($text -replace '\r', ''))) { continue }
         $hits = Find-Keywords $text
         if ($hits.Count -eq 0) { continue }
         $short = ($text -replace '\s+', ' ')
         if ($short.Length -gt 500) { $short = $short.Substring(0, 500) + '...' }
-        $where = if ($blockPath) { "[$blockPath] " } else { '' }
-        Add-Finding -Category "$($sev): PowerShell 4104" -Level 3 -Item "Script block matched: $($hits -join ', ')" -Details ($where + $short) `
-            -Mitre 'T1059.001' -Timestamp (Format-Time $e.TimeCreated)
+        $where = if ($b.Path) { "[$($b.Path)] " } else { '' }
+        $partInfo = if ($b.Total -and $b.Total -ne '1') { " ($($b.Parts.Count)/$($b.Total) parts)" } else { '' }
+        Add-Finding -Category "$($sev): PowerShell 4104" -Level 3 -Item "Script block matched: $($hits -join ', ')" -Details ($where + $short + $partInfo) `
+            -Mitre 'T1059.001' -Timestamp (Format-Time $b.Time)
     }
     # Windows PowerShell engine start (400) - one finding per unique host command line
     $hostApps = @{}
@@ -921,7 +1095,7 @@ function Test-EventLogs {
         $m = [regex]::Match([string]$e.Message, '(?im)HostApplication=(.+)$')
         if (-not $m.Success) { continue }
         $hostApp = $m.Groups[1].Value.Trim()
-        if ($ownScript -and $hostApp -like "*$ownScript*") { continue }
+        if ($ownScript -and $hostApp.IndexOf($ownScript, [StringComparison]::OrdinalIgnoreCase) -ge 0) { continue }   # not -like: [ ] in a path are wildcards
         if (-not $hostApps.ContainsKey($hostApp)) { $hostApps[$hostApp] = [pscustomobject]@{ First = $e.TimeCreated; Last = $e.TimeCreated; Count = 0 } }
         $o = $hostApps[$hostApp]; $o.Count++
         if ($e.TimeCreated -lt $o.First) { $o.First = $e.TimeCreated }
@@ -949,7 +1123,8 @@ function Test-EventLogs {
     # Firewall rule changes (Remote Desktop enabled via netsh)
     foreach ($e in Get-EventsXPath 'Microsoft-Windows-Windows Firewall With Advanced Security/Firewall' (Get-XPathWindow 2004, 2005, 2097, 2099) 2000) {
         $msg = [string]$e.Message
-        if ($msg -notmatch '(?i)remote ?desktop|netsh\.exe|powershell') { continue }
+        # rule names are localized: "Remote Desktop", "Remotedesktop" (de), "Vzdalena plocha" (cs), "Bureau a distance" (fr) ...
+        if ($msg -notmatch '(?i)remote ?desktop|vzd.len. plocha|bureau . distance|escritorio remoto|desktop remoto|pulpit zdalny|vzdialen. plocha|netsh\.exe|powershell') { continue }
         $d = Get-EventDataMap $e
         Add-Finding -Category "$($sev): Firewall rule change" -Level 2 -Item "$($d['RuleName']) ($($e.Id))" `
             -Details "Modifying app: $($d['ModifyingApplication']); user SID: $($d['ModifyingUser'])" -Mitre 'T1562.004 / T1021.001' -Timestamp (Format-Time $e.TimeCreated)
@@ -964,6 +1139,11 @@ function Test-Prefetch {
     $cat = 'Execution: Prefetch'
     $pf = Join-Path $env:SystemRoot 'Prefetch'
     $files = @(Get-ChildItem -LiteralPath $pf -Filter '*.pf' -ErrorAction Stop)
+    # Prefetch is disabled by default on Windows Server (EnablePrefetcher = 0) - say so instead of a silent "0 findings"
+    $pp = Get-ItemProperty -LiteralPath 'Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters' -ErrorAction SilentlyContinue
+    if (($pp -and $pp.PSObject.Properties['EnablePrefetcher'] -and $pp.EnablePrefetcher -eq 0) -or $files.Count -eq 0) {
+        Add-Note 'Prefetch' "Prefetch is disabled or empty ($($files.Count) files) - no evidence of execution from Prefetch (default on Windows Server)"
+    }
     foreach ($f in $files) {
         $exe = ($f.Name -replace '-[0-9A-F]{8}\.pf$', '').ToLowerInvariant()
         $hit = $null; $lvl = 0
@@ -1012,6 +1192,8 @@ function Test-UserAssistAndBam {
         }
     }
 
+    $volumes = Get-VolumeDeviceMap
+    if ($volumes.Count -eq 0) { Add-Note 'BAM' 'Volume device names could not be resolved - BAM paths mapped to the system drive' }
     foreach ($bam in @('Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings',
                        'Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\bam\UserSettings')) {
         Get-ChildItem -LiteralPath $bam -ErrorAction SilentlyContinue | ForEach-Object {
@@ -1020,7 +1202,13 @@ function Test-UserAssistAndBam {
             try { $user = (New-Object Security.Principal.SecurityIdentifier $user).Translate([Security.Principal.NTAccount]).Value } catch { }
             foreach ($vn in $sidKey.GetValueNames()) {
                 if ($vn -notmatch '^\\Device\\') { continue }
-                $path = $vn -replace '^\\Device\\HarddiskVolume\d+', $env:SystemDrive
+                # \Device\HarddiskVolumeN -> drive letter; a volume without a letter (removed USB stick) keeps the
+                # device path: tool names are still matched, the file itself cannot be checked
+                $path = $vn
+                $what = 'last execution (volume has no drive letter now - removable or removed drive)'
+                $dev = [regex]::Match($vn, '^\\Device\\[^\\]+').Value
+                if ($volumes.ContainsKey($dev)) { $path = $volumes[$dev] + $vn.Substring($dev.Length); $what = 'last execution' }
+                elseif ($volumes.Count -eq 0) { $path = $vn -replace '^\\Device\\HarddiskVolume\d+', $env:SystemDrive; $what = 'last execution (volume mapped to system drive - verify)' }
                 $data = $sidKey.GetValue($vn)
                 $last = $null
                 if ($data -is [byte[]] -and $data.Length -ge 8) { try { $last = [DateTime]::FromFileTime([BitConverter]::ToInt64($data, 0)) } catch { } }
@@ -1033,7 +1221,7 @@ function Test-UserAssistAndBam {
                 }
                 if ($a.Behaviour -lt 2 -and -not $recent) { continue }
                 if ($lvl -lt 2) { continue }
-                Add-Finding -Category $cat -Level $lvl -Item "BAM ($user): $path" -Details (Join-Details 'last execution (volume mapped to system drive - verify)' $reasons) `
+                Add-Finding -Category $cat -Level $lvl -Item "BAM ($user): $path" -Details (Join-Details $what $reasons) `
                     -Mitre 'execution' -Timestamp (Format-Time $last)
             }
         }
@@ -1080,17 +1268,75 @@ function Test-ExfilArtifacts {
     }
 }
 
+function Read-RegistryPol {
+    # Parses a Group Policy Registry.pol (PReg v1): [key;value;type;size;data] in UTF-16LE -> "key\value = data"
+    param([string]$Path)
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $out = New-Object System.Collections.Generic.List[string]
+    if ($bytes.Length -lt 8 -or [Text.Encoding]::ASCII.GetString($bytes, 0, 4) -ne 'PReg') { return $out }
+    $u = [Text.Encoding]::Unicode
+    $i = 8
+    $readStr = {   # null-terminated UTF-16 string at $i, followed by ';'
+        $start = $script:polPos
+        while ($script:polPos + 1 -lt $bytes.Length -and ($bytes[$script:polPos] -ne 0 -or $bytes[$script:polPos + 1] -ne 0)) { $script:polPos += 2 }
+        $s = $u.GetString($bytes, $start, $script:polPos - $start)
+        $script:polPos += 4   # terminator + ';'
+        $s
+    }
+    while ($i + 2 -lt $bytes.Length) {
+        if ($bytes[$i] -ne 0x5B) { $i += 2; continue }   # '['
+        $script:polPos = $i + 2
+        $key = & $readStr
+        $val = & $readStr
+        if ($script:polPos + 12 -gt $bytes.Length) { break }
+        $type = [BitConverter]::ToUInt32($bytes, $script:polPos); $script:polPos += 6
+        $size = [int][BitConverter]::ToUInt32($bytes, $script:polPos); $script:polPos += 6
+        if ($size -lt 0 -or $script:polPos + $size -gt $bytes.Length) { break }
+        $data = switch ($type) {
+            { $_ -in 1, 2, 7 } { ($u.GetString($bytes, $script:polPos, $size) -replace "`0+$", '') -replace "`0", ' | ' }   # SZ, EXPAND_SZ, MULTI_SZ
+            4 { if ($size -ge 4) { [BitConverter]::ToUInt32($bytes, $script:polPos) } }                                   # DWORD
+            11 { if ($size -ge 8) { [BitConverter]::ToUInt64($bytes, $script:polPos) } }                                  # QWORD
+            default { "($size bytes, type $type)" }
+        }
+        $out.Add(('{0}\{1} = {2}' -f $key, $val, $data))
+        $i = $script:polPos + $size + 2   # data + ']'
+    }
+    return $out
+}
+
+function Get-SysvolDomainPath {
+    # SYSVOL location from Netlogon (it does not have to be C:\Windows\SYSVOL)
+    $sv = (Get-ItemProperty -LiteralPath 'Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters' -ErrorAction SilentlyContinue).SysVol
+    $candidates = @()
+    if ($sv) {
+        $candidates += Join-Path (Split-Path -Parent $sv) 'domain'
+        $candidates += @(Get-ChildItem -LiteralPath $sv -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    }
+    $candidates += Join-Path $env:SystemRoot 'SYSVOL\domain'
+    foreach ($c in $candidates) { if ($c -and (Test-Path -LiteralPath (Join-Path $c 'Policies'))) { return $c } }
+    return $null
+}
+
 function Test-GpoDeployment {
     $cat = 'Deployment: Group Policy (DC)'
-    $sysvol = Join-Path $env:SystemRoot 'SYSVOL\domain'
-    if (-not (Test-Path -LiteralPath $sysvol)) { Add-Note 'GPO' 'Not a domain controller (no SYSVOL) - skipped'; return }
+    $sysvol = Get-SysvolDomainPath
+    if (-not $sysvol) { Add-Note 'GPO' 'Not a domain controller (no SYSVOL) - skipped'; return }
+    # policy values that disable protection (LockBit / BlackMatter GPO deployment)
+    $badPol = '(?i)\\Windows Defender\\.*\\(DisableAntiSpyware|DisableRealtimeMonitoring|DisableBehaviorMonitoring|DisableIOAVProtection|DisableScriptScanning|DisableOnAccessProtection) = 1$|\\Windows Defender\\Exclusions\\|\\WindowsFirewall\\.*\\EnableFirewall = 0$|\\Windows Defender\\.*\\SubmitSamplesConsent = 2$'
     Get-ChildItem -LiteralPath (Join-Path $sysvol 'Policies') -Recurse -File -Force -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -in @('ScheduledTasks.xml', 'Files.xml', 'Services.xml', 'Registry.pol', 'NetworkShares.xml', 'scripts.ini', 'psscripts.ini') -and $_.LastWriteTime -ge $script:Since } |
         ForEach-Object {
             $content = ''
-            if ($_.Extension -ne '.pol') { try { $content = Get-Content -LiteralPath $_.FullName -Raw -ErrorAction Stop } catch { } }
-            $hits = Find-Keywords $content
-            $lvl = if ($_.Name -in @('ScheduledTasks.xml', 'Files.xml') -or $hits.Count -gt 0 -or $content -match '(?i)taskkill|\.exe') { 3 } else { 2 }
+            $polHits = @()
+            if ($_.Extension -eq '.pol') {
+                try {
+                    $entries = @(Read-RegistryPol $_.FullName)
+                    $content = $entries -join "`n"
+                    $polHits = @($entries | Where-Object { $_ -match $badPol } | Select-Object -First 10)
+                } catch { Add-Note 'GPO' "Registry.pol could not be parsed: $($_.FullName)" }
+            } else { try { $content = Get-Content -LiteralPath $_.FullName -Raw -ErrorAction Stop } catch { } }
+            $hits = @(Find-Keywords $content) + @($polHits | ForEach-Object { "policy: $_" })
+            $lvl = if ($_.Name -in @('ScheduledTasks.xml', 'Files.xml') -or $hits.Count -gt 0 -or ($_.Extension -ne '.pol' -and $content -match '(?i)taskkill|\.exe')) { 3 } else { 2 }
             Add-Finding -Category $cat -Level $lvl -Item $_.FullName -Details (Join-Details 'GPO component modified within window (LockBit GPO deployment)' $hits) `
                 -Mitre 'T1484.001' -Timestamp (Format-Time $_.LastWriteTime)
         }
@@ -1107,15 +1353,17 @@ function Test-StagingFolders {
     $execExt = '^\.(exe|dll|scr|com|msi)$'
     $scriptExt = '^\.(bat|cmd|ps1|psm1|vbs|vbe|js|jse|hta|wsf)$'
     $skipNames = @('pagefile.sys', 'swapfile.sys', 'hiberfil.sys', 'dumpstack.log', 'dumpstack.log.tmp')
-    $ownRoot = $script:Root.TrimEnd('\') + '\'
-    # Mode: staging = classic attacker drop folders, temp = noisy temp folders, user = user content (names/scripts only)
+    # Mode: staging = classic attacker drop folders, temp = noisy temp folders, user = user content (names/scripts only),
+    # vendor = subfolders of ProgramData (full of legitimate unsigned vendor files - only names, attack scripts and new unsigned binaries)
     $targets = New-Object System.Collections.Generic.List[object]
-    $targets.Add(@{ Path = $env:ProgramData;                Depth = 0; Mode = 'staging' })
+    $targets.Add(@{ Path = $env:ProgramData;                Depth = 1; Mode = 'staging'; SubMode = 'vendor' })
     $targets.Add(@{ Path = "$env:SystemDrive\Users\Public"; Depth = 3; Mode = 'staging' })
     $targets.Add(@{ Path = "$env:SystemDrive\PerfLogs";     Depth = 3; Mode = 'staging' })
     $targets.Add(@{ Path = "$env:SystemRoot\Temp";          Depth = 1; Mode = 'temp' })
-    $targets.Add(@{ Path = "$env:SystemDrive\";             Depth = 0; Mode = 'staging' })
     $targets.Add(@{ Path = $env:SystemRoot;                 Depth = 0; Mode = 'staging' })
+    foreach ($drive in (@("$env:SystemDrive\") + @(Get-FixedDrives) | Select-Object -Unique)) {
+        $targets.Add(@{ Path = $drive; Depth = 0; Mode = 'staging' })
+    }
     foreach ($u in Get-UserProfileDirs) {
         $targets.Add(@{ Path = (Join-Path $u.FullName 'AppData\Local\Temp'); Depth = 1; Mode = 'temp' })
         $targets.Add(@{ Path = (Join-Path $u.FullName 'AppData\Roaming');    Depth = 0; Mode = 'staging' })
@@ -1129,10 +1377,13 @@ function Test-StagingFolders {
     foreach ($t in $targets) {
         if (-not (Test-Path -LiteralPath $t.Path)) { continue }
         $files = Get-ChildItem -LiteralPath $t.Path -File -Force -Recurse -Depth $t.Depth -ErrorAction SilentlyContinue
+        $tRoot = $t.Path.TrimEnd('\')
         foreach ($f in $files) {
-            if ($f.FullName.StartsWith($ownRoot, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            if (Test-OwnFile $f.FullName) { continue }
             $nameL = $f.Name.ToLowerInvariant()
             if ($skipNames -contains $nameL) { continue }
+            $mode = $t.Mode
+            if ($t.SubMode -and -not $f.DirectoryName.Equals($tRoot, [StringComparison]::OrdinalIgnoreCase)) { $mode = $t.SubMode }
             $ext = $f.Extension.ToLowerInvariant()
             $isExec = $ext -match $execExt
             $isScript = $ext -match $scriptExt
@@ -1148,8 +1399,12 @@ function Test-StagingFolders {
             }
             if ($nameL -match '^\.[^.]+\.exe$') { $lvl = 3; $reasons.Add('dot-prefixed executable (Crylock pattern)') }
             if ($ext -in '.dmp', '.dit' -and $nameL -match 'lsass|ntds') { $lvl = 3; $reasons.Add('credential dump') }
-            if ($nameL -in @('ad_users.txt', 'ad_computers.txt', 'ad_group.txt', 'trustdmp.txt', 'subnets.txt', 'ad_ous.txt', 'domainlist.txt', 'allwindows.csv', 'hashes.txt', 'ips.txt', 'comps.txt', 'list.txt')) {
-                $lvl = [Math]::Max($lvl, 3); $reasons.Add('AdFind / recon / target-list output name')
+            if ($nameL -in @('ad_users.txt', 'ad_computers.txt', 'ad_group.txt', 'trustdmp.txt', 'subnets.txt', 'ad_ous.txt', 'domainlist.txt', 'allwindows.csv')) {
+                $lvl = [Math]::Max($lvl, 3); $reasons.Add('AdFind / recon output name')
+            }
+            elseif ($nameL -in @('hashes.txt', 'ips.txt', 'comps.txt', 'list.txt')) {
+                # generic names - common in ordinary user documents
+                $lvl = [Math]::Max($lvl, $(if ($mode -in 'staging', 'temp') { 2 } else { 1 })); $reasons.Add('possible target-list name')
             }
 
             if ($isScript -and $f.Length -lt 2MB) {
@@ -1158,18 +1413,22 @@ function Test-StagingFolders {
                 $kw = Find-Keywords $content
                 if ($kw.Count -gt 0) {
                     # attacker-like commands in a drop folder are High; in user documents they may be admin scripts
-                    $lvl = [Math]::Max($lvl, $(if ($t.Mode -eq 'user') { 2 } else { 3 }))
+                    $lvl = [Math]::Max($lvl, $(if ($mode -eq 'user') { 2 } else { 3 }))
                     $reasons.Add('script content: ' + ($kw -join ', '))
                 }
-                elseif ($t.Mode -eq 'staging') { $lvl = [Math]::Max($lvl, 2); $reasons.Add('script in staging folder') }
+                elseif ($mode -eq 'staging') { $lvl = [Math]::Max($lvl, 2); $reasons.Add('script in staging folder') }
             }
-            if ($isExec -and $t.Mode -in 'staging', 'temp' -and $lvl -lt 2) {
+            if ($isExec -and $mode -eq 'vendor' -and $lvl -lt 2 -and $f.CreationTime -ge $script:Since) {
+                $sig = Get-SignatureInfo $f.FullName
+                if (-not $sig.Valid) { $lvl = 2; $reasons.Add('unsigned binary in ProgramData, created within window') }
+            }
+            if ($isExec -and $mode -in 'staging', 'temp' -and $lvl -lt 2) {
                 $sig = Get-SignatureInfo $f.FullName
                 if (-not $sig.Valid) {
                     # unsigned DLLs in Temp are common (Java/JNA, installers) -> Low; elsewhere Medium
-                    $minLvl = if ($t.Mode -eq 'temp' -and $ext -eq '.dll') { 1 } else { 2 }
+                    $minLvl = if ($mode -eq 'temp' -and $ext -eq '.dll') { 1 } else { 2 }
                     $lvl = [Math]::Max($lvl, $minLvl); $reasons.Add('unsigned binary')
-                } elseif ($f.CreationTime -ge $script:Since -and $t.Mode -eq 'staging') {
+                } elseif ($f.CreationTime -ge $script:Since -and $mode -eq 'staging') {
                     $lvl = [Math]::Max($lvl, 1); $reasons.Add("signed ($($sig.Signer)), created within window")
                 }
             }
@@ -1188,12 +1447,15 @@ function Test-StagingFolders {
 function Test-RansomNotes {
     $cat = 'Impact: Ransom notes'
     $roots = @(@{ Path = "$env:SystemDrive\"; Depth = 1 }, @{ Path = "$env:SystemDrive\Users"; Depth = 3 })
+    # other fixed drives (file server data, shares): notes are dropped into every encrypted folder
+    foreach ($drive in Get-FixedDrives) {
+        if (-not $drive.StartsWith($env:SystemDrive, [StringComparison]::OrdinalIgnoreCase)) { $roots += @{ Path = $drive; Depth = 2 } }
+    }
     $found = New-Object System.Collections.Generic.List[object]
-    $ownRoot = $script:Root.TrimEnd('\') + '\'
     foreach ($r in $roots) {
         Get-ChildItem -LiteralPath $r.Path -File -Force -Recurse -Depth $r.Depth -ErrorAction SilentlyContinue | ForEach-Object {
             if ($_.Extension -notmatch '^\.(txt|hta|html?|rtf|url)$') { return }
-            if ($_.FullName.StartsWith($ownRoot, [StringComparison]::OrdinalIgnoreCase)) { return }
+            if (Test-OwnFile $_.FullName) { return }
             $n = $_.Name
             foreach ($p in $script:Ioc.RansomNotePatterns) { if ($n -like $p) { $found.Add($_); break } }
         }
@@ -1240,6 +1502,17 @@ dd{margin:0;font-size:13px;word-break:break-all;white-space:pre-wrap}dd ul{margi
 table.host{border-collapse:collapse}table.host th{color:#828282;text-align:left;font-weight:700;padding:3px 16px 3px 0;font-size:12px;text-transform:uppercase}
 table.host td{font-size:13px;padding:3px 0}
 '@
+}
+
+function Format-MdCode {
+    # Attacker-controlled text as a Markdown code span: rendered literally (no links, HTML, emphasis)
+    param([string]$Text)
+    $t = ($Text -replace '[\r\n]+', ' ').Trim()
+    if (-not $t) { return '' }
+    $longest = (@([regex]::Matches($t, '`+') | ForEach-Object { $_.Length }) + 0 | Measure-Object -Maximum).Maximum
+    $fence = '`' * ($longest + 1)
+    if ($longest -gt 0) { return "$fence $t $fence" }
+    return "$fence$t$fence"
 }
 
 function Split-FindingDetails {
@@ -1297,9 +1570,9 @@ function Export-HtmlReport {
             if ($p.Extra) { $detail = ($detail, $p.Extra | Where-Object { $_ }) -join ' | ' }
             $lines = @($detail -split ' \| ' | Where-Object { $_ })
 
-            & $mdLine "- **[$($f.Severity)] $($f.Item)**"
-            foreach ($l in $lines) { & $mdLine "  - Detail: $l" }
-            foreach ($r in $p.Reasons) { & $mdLine "  - Flagged because: $r" }
+            & $mdLine "- **[$($f.Severity)]** $(Format-MdCode $f.Item)"
+            foreach ($l in $lines) { & $mdLine "  - Detail: $(Format-MdCode $l)" }
+            foreach ($r in $p.Reasons) { & $mdLine "  - Flagged because: $(Format-MdCode $r)" }
             if ($f.Mitre) { & $mdLine "  - MITRE ATT&CK: $($f.Mitre)" }
             if ($f.Timestamp) { & $mdLine "  - Time: $($f.Timestamp)" }
 
@@ -1431,7 +1704,7 @@ function Export-Remediation {
             & $mdLine 'Findings:'
             [void]$ht.AppendLine('<p class="lbl">Findings</p><ul class="items">')
             foreach ($f in ($g.Group | Sort-Object Rank -Descending)) {
-                & $mdLine "- [$($f.Severity)] $($f.Item)"
+                & $mdLine "- [$($f.Severity)] $(Format-MdCode $f.Item)"
                 [void]$ht.AppendLine("<li><span class=""badge $($f.Severity)"">$($f.Severity)</span> <code>$(& $enc $f.Item)</code></li>")
             }
             [void]$ht.AppendLine('</ul>')
@@ -1499,31 +1772,41 @@ Write-Host ("Host: {0}   Window: {1} days (since {2})   Elevated: {3}" -f $env:C
 if (-not $script:IsAdmin) { Write-Host 'WARNING: not running as administrator - Security log, Prefetch, other users and services will be incomplete.' -ForegroundColor Yellow }
 Write-Host ''
 
-Invoke-Check 'Run / RunOnce keys'                { Test-RunKeys }
-Invoke-Check 'Winlogon / IFEO / AppInit'         { Test-WinlogonAndIfeo }
-Invoke-Check 'Startup folders'                   { Test-StartupFolders }
-Invoke-Check 'Scheduled tasks'                   { Test-ScheduledTasks } -NeedsAdmin
-Invoke-Check 'Services'                          { Test-Services }
-Invoke-Check 'WMI event subscriptions'           { Test-WmiPersistence } -NeedsAdmin
-Invoke-Check 'BITS jobs'                         { Test-BitsJobs } -NeedsAdmin
-Invoke-Check 'Remote access / exfil software'    { Test-RemoteAccessSoftware }
-Invoke-Check 'Running processes'                 { Test-RunningProcesses } -NeedsAdmin
-Invoke-Check 'Security configuration'            { Test-SecurityConfiguration }
-Invoke-Check 'Microsoft Defender'                { Test-Defender } -NeedsAdmin
-Invoke-Check 'Shadow copies / boot recovery'     { Test-RecoveryInhibition } -NeedsAdmin
-Invoke-Check 'Local accounts'                    { Test-LocalAccounts }
-Invoke-Check 'Event logs'                        { Test-EventLogs } -NeedsAdmin
-Invoke-Check 'Prefetch'                          { Test-Prefetch } -NeedsAdmin
-Invoke-Check 'UserAssist / BAM'                  { Test-UserAssistAndBam } -NeedsAdmin
-Invoke-Check 'PowerShell console history'        { Test-PowerShellHistory } -NeedsAdmin
-Invoke-Check 'Exfiltration tool artifacts'       { Test-ExfilArtifacts } -NeedsAdmin
-Invoke-Check 'GPO deployment (SYSVOL)'           { Test-GpoDeployment }
+foreach ($p in Get-UnloadedProfiles) {
+    Add-Note 'User hives' "Profile $($p.Name) ($($p.Path)) is not logged on - its HKCU (Run keys, UserAssist, Winlogon, uninstall entries) was not checked. Review $($p.Path)\NTUSER.DAT offline."
+}
+
+$checks = @(
+    @{ Name = 'Run / RunOnce keys';             Script = { Test-RunKeys } }
+    @{ Name = 'Winlogon / IFEO / AppInit';      Script = { Test-WinlogonAndIfeo } }
+    @{ Name = 'Startup folders';                Script = { Test-StartupFolders } }
+    @{ Name = 'Scheduled tasks';                Script = { Test-ScheduledTasks };       Admin = $true }
+    @{ Name = 'Services';                       Script = { Test-Services } }
+    @{ Name = 'Kernel drivers (BYOVD)';         Script = { Test-Drivers } }
+    @{ Name = 'WMI event subscriptions';        Script = { Test-WmiPersistence };       Admin = $true }
+    @{ Name = 'BITS jobs';                      Script = { Test-BitsJobs };             Admin = $true }
+    @{ Name = 'Remote access / exfil software'; Script = { Test-RemoteAccessSoftware } }
+    @{ Name = 'Running processes';              Script = { Test-RunningProcesses };     Admin = $true }
+    @{ Name = 'Security configuration';         Script = { Test-SecurityConfiguration } }
+    @{ Name = 'Microsoft Defender';             Script = { Test-Defender };             Admin = $true }
+    @{ Name = 'Shadow copies / boot recovery';  Script = { Test-RecoveryInhibition };   Admin = $true }
+    @{ Name = 'Local accounts';                 Script = { Test-LocalAccounts } }
+    @{ Name = 'Event logs';                     Script = { Test-EventLogs };            Admin = $true }
+    @{ Name = 'Prefetch';                       Script = { Test-Prefetch };             Admin = $true }
+    @{ Name = 'UserAssist / BAM';               Script = { Test-UserAssistAndBam };     Admin = $true }
+    @{ Name = 'PowerShell console history';     Script = { Test-PowerShellHistory };    Admin = $true }
+    @{ Name = 'Exfiltration tool artifacts';    Script = { Test-ExfilArtifacts };       Admin = $true }
+    @{ Name = 'GPO deployment (SYSVOL)';        Script = { Test-GpoDeployment } }
+)
 if (-not $Quick) {
-    Invoke-Check 'Staging folders & tool files'  { Test-StagingFolders } -NeedsAdmin
-    Invoke-Check 'Ransom notes'                  { Test-RansomNotes } -NeedsAdmin
+    $checks += @{ Name = 'Staging folders & tool files'; Script = { Test-StagingFolders }; Admin = $true }
+    $checks += @{ Name = 'Ransom notes';                 Script = { Test-RansomNotes };    Admin = $true }
 } else {
     Add-Note 'File system' 'Skipped (-Quick)'
 }
+# the app reads this line for its progress bar
+Write-Host "Checks: $($checks.Count)"
+foreach ($c in $checks) { Invoke-Check $c.Name $c.Script -NeedsAdmin:([bool]$c.Admin) }
 
 # ---- output
 if (-not $OutputPath) { $OutputPath = Join-Path $script:Root 'Reports' }
@@ -1548,8 +1831,14 @@ $hostInfo = [pscustomobject][ordered]@{
     Tool         = "RansomwareChecker $($script:Version)"
 }
 
-$sorted | Select-Object Severity, Category, Item, Details, Mitre, Timestamp |
-    Export-Csv -LiteralPath (Join-Path $outDir 'findings.csv') -NoTypeInformation -Encoding UTF8
+# CSV: cells come from attacker-controlled text - neutralise formulas (=, +, -, @, tab, CR) for Excel
+$csvSafe = { param($v) $s = [string]$v; if ($s -match '^[=+\-@\t\r]') { "'" + $s } else { $s } }
+$sorted | ForEach-Object {
+    [pscustomobject][ordered]@{
+        Severity = $_.Severity; Category = & $csvSafe $_.Category; Item = & $csvSafe $_.Item
+        Details = & $csvSafe $_.Details; Mitre = $_.Mitre; Timestamp = $_.Timestamp
+    }
+} | Export-Csv -LiteralPath (Join-Path $outDir 'findings.csv') -NoTypeInformation -Encoding UTF8
 [pscustomobject]@{ Host = $hostInfo; Findings = @($sorted | Select-Object Severity, Category, Item, Details, Mitre, Timestamp); Notes = $script:Notes } |
     ConvertTo-Json -Depth 5 | Out-File -LiteralPath (Join-Path $outDir 'findings.json') -Encoding UTF8
 $htmlPath = Join-Path $outDir 'report.html'
@@ -1578,8 +1867,8 @@ if ($h -gt 0) { exit 2 } elseif ($m -gt 0) { exit 1 } else { exit 0 }
 # SIG # Begin signature block
 # MIIdowYJKoZIhvcNAQcCoIIdlDCCHZACAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCgkJBxpdk8BG2y
-# VseEpShaUyENiHxVoN/BKlegPRPBtaCCF2AwggQiMIICiqADAgECAhB1VkCOhmLH
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCtVYxwlO16zy0X
+# RY5fXdv49rHmwPoEJW6rN491Ar1avaCCF2AwggQiMIICiqADAgECAhB1VkCOhmLH
 # gU1PkVGYpUTbMA0GCSqGSIb3DQEBCwUAMCkxJzAlBgNVBAMMHlJhbnNvbXdhcmVD
 # aGVja2VyIENvZGUgU2lnbmluZzAeFw0yNjEwMzExNzM3MThaFw0zMTEwMzExNzQ3
 # MTZaMCkxJzAlBgNVBAMMHlJhbnNvbXdhcmVDaGVja2VyIENvZGUgU2lnbmluZzCC
@@ -1708,31 +1997,31 @@ if ($h -gt 0) { exit 2 } elseif ($m -gt 0) { exit 1 } else { exit 0 }
 # ZWNrZXIgQ29kZSBTaWduaW5nAhB1VkCOhmLHgU1PkVGYpUTbMA0GCWCGSAFlAwQC
 # AQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwG
 # CisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZI
-# hvcNAQkEMSIEIPwlOQTHdV8h0CUoOxbhxo1K4jvI22wsOyZjrhEc3vVrMA0GCSqG
-# SIb3DQEBAQUABIIBgK49vLnqGLPb5SqIc9j+S0alMn6ovNcvGP2DmC7bcrLUJqO+
-# +tfsOSB4O4s3L6t5aMV0sQ93XBQEWsKrFEL+X10fZvPeXSIysadxtW9G5Y2217HE
-# 98BNbK31H0h3ykIYp12TAOWeMXxahbCnmYyxc/yFQGJ3b7+7Ej4fjH33MOh8nw/9
-# DU1uFQZ8hs2gi7txy+XYiz+HSPhHpY+fHQzlV55EP/C8I9gXYqBhmF6IPe7fePEh
-# ET+MfvN87Vh/G8xJqOnQd93c0hwhtQZRIoJoFNeCBv3sQdGE8zSPHRo5SjCGrYq4
-# uPsEFSIHcwHDzQZJE7ICa+q7J12ZqiLT33P/sijm7wuk8c5w7opKMm0rCMmvOYID
-# OjBAHlnUR0LuPl8XT//onRF6cIfOnCYcowUuZUVp2lbqgBmxpcYGBB7JGj/ew/JA
-# MtbyBlLXz9tH6M/GrCejI3GMUggKIwIesSTg956eTsOHXHGyPMDfIk9rRmYHNWP7
-# Je01z598eJeui06XGqGCAyYwggMiBgkqhkiG9w0BCQYxggMTMIIDDwIBATB9MGkx
+# hvcNAQkEMSIEIDWBPnC4SpCtCs99cdMB8K/XLziiJ1ihSLDyigFUt2m7MA0GCSqG
+# SIb3DQEBAQUABIIBgGsUVXn5ptVnWIA2+Brg6N3YsiBNDyVVbmVqUJqUH90KDIkT
+# 90DlRQ/S7pcKr04LwLHBPVC5xyPxulKLUtgt/LceGwhHmoMs98wmfDbqq9DOk0Xj
+# Zf2Mkl3YGsedjxgNbCwCXEFAkf/dqf/e/XA5kH8x/KwowcTM+9ZVClX5Rw5mywkG
+# JFQpX2tNBgvZQU2Il7ja7w6RPQJbf5h6fC25Qivns2adMdnz6XkHGz6hlgtaWBGY
+# AbB6WWrfSIEv6qqMYLNTG0xXz2zH0HYDOHZ4UX3AKda63jz9OnhP9KVA2Z2OPnZC
+# 2g1eG55ALI0mpYHxpX3fsNIS9k8c4/ZWglOfya0kLWd3zJ+E30atOK5s+gTYtzN4
+# jf1ComVQDValCo/25SqcF5p0aql/ucsQvaM3teKGfiDlYdLwoMDzwXyjUTrsWgeD
+# VjgQK81R4kiUQgqq/kIqY6FCY0l20NRnI1kTiSpXItVyc54x4E+VPTvhBKKO+xCO
+# gCTRAZcB28Y3SyBbLKGCAyYwggMiBgkqhkiG9w0BCQYxggMTMIIDDwIBATB9MGkx
 # CzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5jLjFBMD8GA1UEAxM4
 # RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNBNDA5NiBTSEEyNTYg
 # MjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUDBAIBBQCgaTAYBgkq
-# hkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEPFw0yNjEwMzExODM5
-# MjBaMC8GCSqGSIb3DQEJBDEiBCCJp8S8nVOB88clUs6hB2js5blZF5lecuBbKIc6
-# HpR6JjANBgkqhkiG9w0BAQEFAASCAgCiAnTQDHN7XHxA0cPJFX0VRRZa5g+LrxUY
-# pf2Q3EfU7ulDjLBI6h3CYBE7wQWUqVqOHcPdKAefyIU88tOpYIH5oG250r99ROEL
-# RKTpvS5mM5WoOijKHgj7n7Ts8GAv3/XmIbH9zNSPExq5IuRxuo3IwS/1YHIsGuao
-# WtTDO1T9ZP6/PEWtqAJC0RtVO9mZ4pXAQvTWeokYpE797K5Z+clxnQ3vi4wQTJQE
-# xJCFkzRK9EOZsKmUsvj8piYtssdc64GS/brS1NcUfn6XBsF0RVGkj03CzT0KtrxH
-# Da6p3ODYjUf1bs0klNOAl/PvhwcJ/3gLHO4FP1TWQrJcuCsrFwgSMsZLTZy27+Nv
-# DXUORzqaCHjLGuorg4poO32xZbjcARPdjVGFUkgBu61/Qrhc5rMpOo+3Vi8gxa4o
-# opQxeGwQspm8PHePzPy0sidMVVCTolWVTNw6CcX6vudZ7m82VHAlDKKOgEqKVpU/
-# n3TJg3i3yle4kMeJLgr/aIX0oXoVhe+NR2Bt6eaU0gDzjvXZyTCzTHkF6ccLYTE4
-# S8n3KDxfTlTJnsbv0ChNe3E/96DtB5LhBn+Rgb6gxwpWHDHM+BYa8HPOuOGCgjBZ
-# TBuEOrGNNwtZZ27pRfGNpDNLn0vBy++DTbCdNjkIDlosJOhCRKB3O+5Chhh/gmHQ
-# m09/q50Fqw==
+# hkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEPFw0yNjEwMzEyMTM2
+# MzFaMC8GCSqGSIb3DQEJBDEiBCB1udod7xB8OuYScaaWWekzUAVAsbHHOU285GVM
+# TkT5XDANBgkqhkiG9w0BAQEFAASCAgAgS7e5eooDSEMccLOKFO6Gw2WE/4K9V5hN
+# S4P/XQNZQYRsRVAq+npaGa2NvdKr5L/p+d2GkEcEx9krn5vR5oyfp+Xj4iGaNMXI
+# CCLA2l2cRRwJnlJq1UKoUn0jRF677uVNuG4Ls08HKm/7Lzc3sMItevQ6LWZIDyin
+# pKXRtGpG7CpawpVi85xmFgUmv5bB7jIF95IrcRoOr87PQY0aAvKXEoDJADT2moVS
+# P0NxA2ytcMPLoNqdoncVbc0C5N8H+wnjPOXiqaHV0b+wEHxBwCd0EIkP0WIQs3n9
+# cJODiz03QXD4slcflNHOlboSfyA9tdH3eRkNVO2GAVY07tvZVr+lPp6nDnYiytSb
+# 633Y6LTIe4H/NCF8nvWxqz2FKDbD8VdC8es+wTFozF7hobETEn0LY2JOCfQbSv31
+# Gev9QQ+3Fl0NwcdIu2uab3q6e/sPQp16A1B72GK0OkJPQ0IamMozmx9owneY8898
+# fclQnxZhxIt3I2gwzZzW55+lOJ48kD4YXd9fWXXoQRVeqE9QbCPVw1Nbfdrz1U3K
+# KvXZ+TsuaTYncPCLXkDfaCKEepVrqILhMnpvg7WbfHf1XTF2dNEIzFmIlfvnAEK+
+# lViT/i5Ar1tWOnTK1qnTVplCmnw7qRyJBGyynU/hTggQ1EpqB5fnLuvkjhXHCEPp
+# QQGDxNIvIw==
 # SIG # End signature block

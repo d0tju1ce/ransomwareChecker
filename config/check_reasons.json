@@ -15,6 +15,9 @@
   "Persistence: Services": {
     "Why": "Services run with SYSTEM privileges and are abused for execution, privilege escalation and lateral movement. A Cobalt Strike Beacon started via 'jump psexec_psh' creates a new service; PsExec installs PSEXESVC; REvil was deployed by a service running '%COMSPEC% /C start /b powershell \\\\srvdc01\\...\\msedgeupdater.exe'."
   },
+  "Defense evasion: Kernel drivers (BYOVD)": {
+    "Why": "Bring Your Own Vulnerable Driver: affiliates load a legitimately signed but vulnerable driver and use it to kill EDR/AV processes from the kernel before deploying ransomware - e.g. RTCore64.sys (BlackByte, AvosLocker), aswArPot.sys (Cuba, AvosLocker), gdrv.sys (RobbinHood), zam64.sys (Terminator / Spyboy). Drivers loaded from unusual folders or without a valid signature are suspicious on their own."
+  },
   "Persistence: WMI subscriptions": {
     "Why": "Ransomware affiliates abuse WMI to execute code locally and remotely (Cobalt Strike has it built in). Permanent WMI event subscriptions (CommandLine / ActiveScript consumers) give the same code a fileless, reboot-proof autostart. See MITRE T1546.003."
   },

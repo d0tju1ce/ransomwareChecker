@@ -24,6 +24,12 @@
     "client32.exe", "dwagent", "logmein", "zohoassist", "simplehelp", "kaseya", "level.io"
   ],
 
+  "VulnerableDrivers": [
+    "rtcore64.sys", "rtcore32.sys", "gdrv.sys", "aswarpot.sys", "mhyprot2.sys", "mhyprot3.sys",
+    "procexp152.sys", "zam64.sys", "zamguard64.sys", "dbutil_2_3.sys", "iqvw64e.sys", "truesight.sys",
+    "kprocesshacker.sys", "viragt64.sys", "gmer64.sys"
+  ],
+
   "SystemBinaryNames": [
     "svchost.exe", "lsass.exe", "csrss.exe", "services.exe", "smss.exe", "winlogon.exe",
     "wininit.exe", "explorer.exe", "rundll32.exe", "conhost.exe", "taskhostw.exe",
@@ -62,7 +68,7 @@
   ],
 
   "CommandKeywords": [
-    "comsvcs(\\.dll)?[\"',\\s]+#?\\s*minidump",
+    "comsvcs(\\.dll)?[\"',\\s]+(#?\\s*mini?dump|#\\s*\\+?0*24\\b)",
     "sekurlsa::",
     "lsass\\.(dmp|zip)",
     "procdump.*lsass",
@@ -94,7 +100,7 @@
     "mega\\.nz",
     "dropmefiles",
     "downloadstring|downloadfile|frombase64string",
-    "-enc(odedcommand)?\\s+[a-z0-9+/=]{20,}",
+    "\\s[-/\\u2013\\u2014\\u2015](ec|e|en\\w*)\\s+[a-z0-9+/=]{20,}",
     "bitsadmin.*/transfer",
     "certutil.*(-decode|-urlcache)"
   ],
