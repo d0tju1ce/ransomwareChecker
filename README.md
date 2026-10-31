@@ -137,6 +137,12 @@ Import-Certificate -FilePath .\cert\RansomwareChecker.cer -CertStoreLocation Cer
 
 Without the import the signature shows as untrusted (`UnknownError`), but you can still verify file integrity by the thumbprint.
 
+## Sources
+
+The checks, the reasons behind them and the remediation steps are based on:
+
+* Oleg Skulkin: *Incident Response Techniques for Ransomware Attacks*, Packt Publishing, 2022.
+
 ## License
 
 The code is licensed under MIT (see `LICENSE`). The Oswald font is licensed under the SIL Open Font License 1.1 (`licenses\Oswald-OFL.txt`).
