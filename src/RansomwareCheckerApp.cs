@@ -405,7 +405,8 @@ namespace RansomwareChecker
         public readonly List<string> Steps = new List<string>();   // recommended remediation (config\remediation.json)
         public bool Expanded;
         public int Mark;   // Marks.None / FalsePositive / Suspicious (marks.json)
-        public string Key { get { return Category + "|" + Item; } }
+        public string Computer = "";   // computer of the report; marks are kept per computer
+        public string Key { get { return Computer + "|" + Category + "|" + Item; } }
 
         public static int RankOf(string sev)
         {
@@ -451,8 +452,9 @@ namespace RansomwareChecker
     }
 
     // Analyst marks kept between runs in marks.json next to the exe. False positive = the detection is snoozed
-    // (dimmed, sorted last, not counted); suspicious = highlighted row. Key = category + item, so the same finding
-    // in a later report keeps its mark.
+    // (dimmed, sorted last, not counted); suspicious = highlighted row. Marks are stored per computer
+    // ({"PC": {"category|item": "FalsePositive"}}), so the same finding in a later report of the same computer keeps
+    // its mark, but a copy of the tool taken to another computer does not hide anything there.
     static class Marks
     {
         public const int None = 0, FalsePositive = 1, Suspicious = 2;
@@ -470,12 +472,21 @@ namespace RansomwareChecker
                 if (root == null) return;
                 foreach (var kv in root)
                 {
-                    string v = Convert.ToString(kv.Value);
-                    if (v == "FalsePositive") map[kv.Key] = FalsePositive;
-                    else if (v == "Suspicious") map[kv.Key] = Suspicious;
+                    var perPc = kv.Value as Dictionary<string, object>;
+                    if (perPc != null)
+                        foreach (var m in perPc) Put(kv.Key + "|" + m.Key, m.Value);
+                    else
+                        Put(Environment.MachineName + "|" + kv.Key, kv.Value);   // 1.2.0 format without computer = made on this computer
                 }
             }
             catch { }
+        }
+
+        static void Put(string key, object value)
+        {
+            string v = Convert.ToString(value);
+            if (v == "FalsePositive") map[key] = FalsePositive;
+            else if (v == "Suspicious") map[key] = Suspicious;
         }
 
         public static void Apply(Finding f)
@@ -492,12 +503,27 @@ namespace RansomwareChecker
             if (mark == None) map.Remove(f.Key); else map[f.Key] = mark;
             try
             {
+                // key = "computer|category|item" (a computer name cannot contain "|") -> grouped by computer
+                var byPc = new SortedDictionary<string, List<KeyValuePair<string, int>>>(StringComparer.OrdinalIgnoreCase);
+                foreach (var kv in map)
+                {
+                    int bar = kv.Key.IndexOf('|');
+                    string pc = kv.Key.Substring(0, bar);
+                    if (!byPc.ContainsKey(pc)) byPc[pc] = new List<KeyValuePair<string, int>>();
+                    byPc[pc].Add(new KeyValuePair<string, int>(kv.Key.Substring(bar + 1), kv.Value));
+                }
                 var sb = new StringBuilder("{\r\n");
                 var ser = new JavaScriptSerializer();
-                int n = 0;
-                foreach (var kv in map)
-                    sb.Append("  ").Append(ser.Serialize(kv.Key)).Append(": ").Append(kv.Value == FalsePositive ? "\"FalsePositive\"" : "\"Suspicious\"")
-                      .Append(++n < map.Count ? ",\r\n" : "\r\n");
+                int p = 0;
+                foreach (var pc in byPc)
+                {
+                    sb.Append("  ").Append(ser.Serialize(pc.Key)).Append(": {\r\n");
+                    for (int i = 0; i < pc.Value.Count; i++)
+                        sb.Append("    ").Append(ser.Serialize(pc.Value[i].Key)).Append(": ")
+                          .Append(pc.Value[i].Value == FalsePositive ? "\"FalsePositive\"" : "\"Suspicious\"")
+                          .Append(i < pc.Value.Count - 1 ? ",\r\n" : "\r\n");
+                    sb.Append("  }").Append(++p < byPc.Count ? ",\r\n" : "\r\n");
+                }
                 sb.Append("}\r\n");
                 File.WriteAllText(file, sb.ToString(), new UTF8Encoding(false));
                 return true;
@@ -1016,7 +1042,8 @@ namespace RansomwareChecker
                 foreach (var d in List(fo))
                 {
                     var f = new Finding { Severity = S(d, "Severity"), Category = S(d, "Category"), Item = S(d, "Item"),
-                        Details = S(d, "Details"), Mitre = S(d, "Mitre"), Timestamp = S(d, "Timestamp") };
+                        Details = S(d, "Details"), Mitre = S(d, "Mitre"), Timestamp = S(d, "Timestamp"),
+                        Computer = r.Computer.Length > 0 ? r.Computer : Environment.MachineName };
                     f.Rank = Finding.RankOf(f.Severity);
                     f.Split();
                     CheckReasons.Apply(f);

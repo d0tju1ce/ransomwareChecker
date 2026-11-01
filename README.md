@@ -62,8 +62,9 @@ runs a new check. Further checks run only on demand (**Run check again**).
 - Right-click to copy a finding, copy all findings, or expand / collapse all.
 - Right-click → **Mark as false positive** snoozes a finding: its text turns dark, it moves to the end of the list in the
   next report and it no longer counts towards the severity counts and the headline. **Mark as suspicious** highlights
-  the row in light red. Choosing the same item again removes the mark. Marks are kept in `marks.json` next to the exe
-  (key = category + item), so a finding keeps its mark in later reports. They affect only the app, not the HTML report.
+  the row in muted red. Choosing the same item again removes the mark. Marks are kept in `marks.json` next to the exe,
+  separately for each computer (computer + category + item): a finding keeps its mark in later reports of the same
+  computer, but a copy of the tool taken to another computer hides nothing there. They affect only the app, not the HTML report.
 - **Remediation plan**, **HTML report** and **Report folder** open the outputs of the shown report.
 - *Coverage notes* in the footer list anything that could not be checked.
 
@@ -216,6 +217,10 @@ installed. The build signs the script, pins its hash and the config hashes into 
 compiles and signs the exe. Signing is skipped if the certificate is not present in `Cert:\CurrentUser\My`.
 Rebuild after every change of the script or the pinned config files.
 
+`src\make_dist.ps1` then builds the distribution package `dist\RansomwareChecker-<version>.zip` (+ `.sha256`). It checks
+that the exe and the script have the same version and valid signatures, and leaves out local data: `marks.json`,
+`RansomwareChecker.ini` (the app creates default settings), `Reports\`, `Remediation\`, `src\` and `docs\`.
+
 ## Known limitations
 
 - User registry hives are read only for **logged-on** users. Loading an offline `NTUSER.DAT` would change the system,
@@ -244,9 +249,11 @@ Analyst marks in the desktop app.
 - Right-click a finding: **Mark as false positive** snoozes the detection (dimmed text, sorted last, not counted in
   the severity counts and the headline); **Mark as suspicious** highlights the row in muted red. Choosing the same
   item again removes the mark; the two marks exclude each other.
-- Marks are kept in `marks.json` next to the exe (key = category + item), so findings keep their marks in later reports.
+- Marks are kept in `marks.json` next to the exe, separately for each computer (computer + category + item): findings
+  keep their marks in later reports of the same computer, and a copy of the tool taken to another computer hides nothing there.
 - New **False positive** / **Suspicious** filter chips show only the marked findings (combined with severity filter and search).
 - Expanded findings show a *Marked* row; copied findings include the mark.
+- `src\make_dist.ps1` builds a clean distribution ZIP without local data (marks, settings, reports).
 
 ### 1.1.0
 
