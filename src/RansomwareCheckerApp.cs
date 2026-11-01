@@ -23,7 +23,7 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("RansomwareChecker")]
 [assembly: AssemblyProduct("RansomwareChecker")]
-[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.2.0.0")]
 
 namespace RansomwareChecker
 {
@@ -54,7 +54,7 @@ namespace RansomwareChecker
     static class App
     {
         public const string Name = "RansomwareChecker";
-        public const string Version = "1.1.0";
+        public const string Version = "1.2.0";
         public static readonly Color Accent = Color.FromArgb(210, 210, 210);     // retro off-white (softer contrast)
         public static readonly Color AccentHover = Color.FromArgb(185, 185, 185);
         public static readonly Color AccentDown = Color.FromArgb(150, 150, 150);
@@ -85,6 +85,13 @@ namespace RansomwareChecker
         public static Color NeutralBg { get { return Color.FromArgb(18, 18, 18); } }
         public static Color NeutralFg { get { return Color.FromArgb(130, 130, 130); } }
         public static Color SwitchOff { get { return Color.FromArgb(80, 80, 80); } }
+        // Analyst marks: false positive = dimmed text; suspicious = light red row
+        public static Color Sleep { get { return Color.FromArgb(78, 78, 78); } }
+        public static Color SuspectBack { get { return Color.FromArgb(168, 120, 120); } }
+        public static Color SuspectHover { get { return Color.FromArgb(180, 130, 130); } }
+        public static Color SuspectText { get { return Color.FromArgb(28, 10, 10); } }
+        public static Color SuspectMuted { get { return Color.FromArgb(72, 32, 32); } }
+        public static Color SuspectBar { get { return Color.FromArgb(168, 96, 96); } }
 
         // Retro look: square corners everywhere (radius is ignored)
         public static GraphicsPath Rounded(RectangleF r, float radius)
@@ -101,6 +108,8 @@ namespace RansomwareChecker
                 case "High": fg = Bad; bg = BadBg; break;
                 case "Medium": fg = Warn; bg = WarnBg; break;
                 case "Low": fg = Info; bg = InfoBg; break;
+                case "False positive": fg = Text; bg = Sleep; break;     // mark filter chips
+                case "Suspicious": fg = SuspectText; bg = SuspectBack; break;
                 default: fg = NeutralFg; bg = NeutralBg; break;
             }
         }
@@ -395,6 +404,8 @@ namespace RansomwareChecker
         public string Why = "";   // why the check exists (config\check_reasons.json)
         public readonly List<string> Steps = new List<string>();   // recommended remediation (config\remediation.json)
         public bool Expanded;
+        public int Mark;   // Marks.None / FalsePositive / Suspicious (marks.json)
+        public string Key { get { return Category + "|" + Item; } }
 
         public static int RankOf(string sev)
         {
@@ -422,6 +433,8 @@ namespace RansomwareChecker
             var sb = new StringBuilder();
             sb.AppendLine("[" + Severity + "] " + Category);
             sb.AppendLine(Item);
+            if (Mark == Marks.FalsePositive) sb.AppendLine("Marked: false positive");
+            else if (Mark == Marks.Suspicious) sb.AppendLine("Marked: suspicious");
             if (Main.Length > 0) sb.AppendLine(Main);
             foreach (var r in Reasons) sb.AppendLine("  - " + r);
             if (Extra.Length > 0) sb.AppendLine(Extra);
@@ -434,6 +447,67 @@ namespace RansomwareChecker
                 for (int i = 0; i < Steps.Count; i++) sb.AppendLine("  " + (i + 1) + ". " + Steps[i].Replace("<item>", Item));
             }
             return sb.ToString();
+        }
+    }
+
+    // Analyst marks kept between runs in marks.json next to the exe. False positive = the detection is snoozed
+    // (dimmed, sorted last, not counted); suspicious = highlighted row. Key = category + item, so the same finding
+    // in a later report keeps its mark.
+    static class Marks
+    {
+        public const int None = 0, FalsePositive = 1, Suspicious = 2;
+        static readonly Dictionary<string, int> map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        static string file;
+
+        public static void Load(string path)
+        {
+            file = path;
+            map.Clear();
+            try
+            {
+                if (!File.Exists(path)) return;
+                var root = new JavaScriptSerializer().DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
+                if (root == null) return;
+                foreach (var kv in root)
+                {
+                    string v = Convert.ToString(kv.Value);
+                    if (v == "FalsePositive") map[kv.Key] = FalsePositive;
+                    else if (v == "Suspicious") map[kv.Key] = Suspicious;
+                }
+            }
+            catch { }
+        }
+
+        public static void Apply(Finding f)
+        {
+            int m;
+            f.Mark = map.TryGetValue(f.Key, out m) ? m : None;
+        }
+
+        // Saves the new mark of a finding; on a write error the old mark stays and false is returned
+        public static bool Set(Finding f, int mark)
+        {
+            int old;
+            bool had = map.TryGetValue(f.Key, out old);
+            if (mark == None) map.Remove(f.Key); else map[f.Key] = mark;
+            try
+            {
+                var sb = new StringBuilder("{\r\n");
+                var ser = new JavaScriptSerializer();
+                int n = 0;
+                foreach (var kv in map)
+                    sb.Append("  ").Append(ser.Serialize(kv.Key)).Append(": ").Append(kv.Value == FalsePositive ? "\"FalsePositive\"" : "\"Suspicious\"")
+                      .Append(++n < map.Count ? ",\r\n" : "\r\n");
+                sb.Append("}\r\n");
+                File.WriteAllText(file, sb.ToString(), new UTF8Encoding(false));
+                return true;
+            }
+            catch (Exception ex)
+            {
+                if (had) map[f.Key] = old; else map.Remove(f.Key);
+                MessageBox.Show("The mark could not be saved to " + file + ":\r\n" + ex.Message, App.Name, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
         }
     }
 
@@ -481,6 +555,30 @@ namespace RansomwareChecker
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Expand all", null, delegate { foreach (var f in items) f.Expanded = true; Relayout(); });
             menu.Items.Add("Collapse all", null, delegate { foreach (var f in items) f.Expanded = false; Relayout(); });
+            menu.Items.Add(new ToolStripSeparator());
+            var miFp = new ToolStripMenuItem("", null, delegate { ToggleMark(Marks.FalsePositive); });
+            var miSus = new ToolStripMenuItem("", null, delegate { ToggleMark(Marks.Suspicious); });
+            menu.Items.Add(miFp);
+            menu.Items.Add(miSus);
+            menu.Opening += delegate
+            {
+                var f = menuIndex >= 0 && menuIndex < items.Count ? items[menuIndex] : null;
+                miFp.Text = f != null && f.Mark == Marks.FalsePositive ? "Unmark false positive" : "Mark as false positive";
+                miSus.Text = f != null && f.Mark == Marks.Suspicious ? "Unmark suspicious" : "Mark as suspicious";
+            };
+        }
+
+        // Raised after a mark was saved (the form updates counts and the other findings with the same key)
+        public event EventHandler MarksChanged;
+
+        // The same mark again = unmark; false positive and suspicious exclude each other
+        void ToggleMark(int mark)
+        {
+            if (menuIndex < 0 || menuIndex >= items.Count) return;
+            var f = items[menuIndex];
+            if (!Marks.Set(f, f.Mark == mark ? Marks.None : mark)) return;
+            if (MarksChanged != null) MarksChanged(this, EventArgs.Empty);
+            Relayout();
         }
 
         static void Copy(string text)
@@ -504,7 +602,7 @@ namespace RansomwareChecker
         // The ITEM title uses the UI font; the sections below it (DETAIL, WHY CHECKED, REMEDIATION, CATEGORY) use
         // one monospace font (fBody = Consolas), one color and the same spacing, so all sections read the same way.
         const int RowGap = 10;
-        static readonly string[] LabelNames = { "ITEM", "DETAIL", "FLAGGED BECAUSE", "WHY CHECKED", "REMEDIATION", "MITRE ATT&CK", "CATEGORY", "TIME" };
+        static readonly string[] LabelNames = { "ITEM", "DETAIL", "FLAGGED BECAUSE", "WHY CHECKED", "REMEDIATION", "MITRE ATT&CK", "CATEGORY", "TIME", "MARKED" };
 
         // ITEM = title font; MITRE ATT&CK and TIME = UI font (Oswald); the other sections = Consolas
         Font RowFont(string label)
@@ -522,6 +620,10 @@ namespace RansomwareChecker
         {
             var rows = new List<Tuple<string, string>>();
             rows.Add(Tuple.Create(LabelNames[0], f.Item));
+            if (f.Mark == Marks.FalsePositive)
+                rows.Add(Tuple.Create(LabelNames[8], "False positive - detection snoozed (not counted; the mark is kept for later reports)"));
+            else if (f.Mark == Marks.Suspicious)
+                rows.Add(Tuple.Create(LabelNames[8], "Suspicious - flagged for further investigation"));
             string detail = f.Main;
             if (f.Extra.Length > 0) detail = (detail.Length > 0 ? detail + "\n" : "") + f.Extra;
             // "path | actions: ... | user: ..." -> one part per line
@@ -716,15 +818,20 @@ namespace RansomwareChecker
                 int top = tops[i] + oy;
                 if (top > ClientSize.Height || top + heights[i] < 0) continue;
                 var f = items[i];
+                bool fp = f.Mark == Marks.FalsePositive, sus = f.Mark == Marks.Suspicious;
+                Color text = fp ? Theme.Sleep : sus ? Theme.SuspectText : Theme.Text;
+                Color muted = fp ? Theme.Sleep : sus ? Theme.SuspectMuted : Theme.Muted;
                 if (f.Expanded)
                     using (var b = new SolidBrush(Theme.OpenBack)) g.FillRectangle(b, 0, top, w, heights[i]);
-                else if (i == hover)
+                else if (i == hover && !sus)
                     using (var b = new SolidBrush(Theme.HoverBack)) g.FillRectangle(b, 0, top, w, rowH);
+                if (sus)
+                    using (var b = new SolidBrush(i == hover ? Theme.SuspectHover : Theme.SuspectBack)) g.FillRectangle(b, 0, top, w, rowH);
 
                 // Chevron
                 g.SmoothingMode = SmoothingMode.AntiAlias;
                 float cx = 14, cy = top + rowH / 2f;
-                using (var pen = new Pen(Theme.Muted, 1.6f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+                using (var pen = new Pen(muted, 1.6f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
                 {
                     if (f.Expanded) g.DrawLines(pen, new[] { new PointF(cx - 4, cy - 2), new PointF(cx, cy + 2), new PointF(cx + 4, cy - 2) });
                     else g.DrawLines(pen, new[] { new PointF(cx - 2, cy - 4), new PointF(cx + 2, cy), new PointF(cx - 2, cy + 4) });
@@ -733,6 +840,7 @@ namespace RansomwareChecker
                 // Severity pill
                 Color fg, bg;
                 Theme.Severity(f.Severity, out fg, out bg);
+                if (fp) { fg = Theme.Sleep; bg = Theme.Card; }   // snoozed: outlined dark pill
                 int pillH = fPill.Height + 4;
                 var pill = new RectangleF(32, top + (rowH - pillH) / 2f, pillW, pillH);
                 using (var path = Theme.Rounded(pill, 3))
@@ -746,12 +854,12 @@ namespace RansomwareChecker
 
                 // Category | item | time
                 int x = 32 + pillW + 14;
-                TextRenderer.DrawText(g, f.Category, fSmall, new Rectangle(x, top, catW - 10, rowH), Theme.Muted, Line);
+                TextRenderer.DrawText(g, f.Category, fSmall, new Rectangle(x, top, catW - 10, rowH), muted, Line);
                 x += catW;
                 int itemW = w - x - timeW - 12;
-                TextRenderer.DrawText(g, f.Item, fItem, new Rectangle(x, top, Math.Max(40, itemW), rowH), Theme.Text, Line);
+                TextRenderer.DrawText(g, f.Item, fItem, new Rectangle(x, top, Math.Max(40, itemW), rowH), text, Line);
                 if (showTime && !string.IsNullOrEmpty(f.Timestamp))
-                    TextRenderer.DrawText(g, f.Timestamp, fSmall, new Rectangle(w - timeW - 8, top, timeW, rowH), Theme.Muted,
+                    TextRenderer.DrawText(g, f.Timestamp, fSmall, new Rectangle(w - timeW - 8, top, timeW, rowH), muted,
                         Line | TextFormatFlags.Right);
 
                 // Expanded details
@@ -766,10 +874,10 @@ namespace RansomwareChecker
                         int labelOffset = (font.Height - fLabel.Height) / 2;
                         TextRenderer.DrawText(g, r.Item1, fLabel, new Rectangle(DetailX + 32, y + labelOffset, LabelWidth, fLabel.Height),
                             Theme.Muted, TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
-                        LayoutBody(g, r.Item1, r.Item2, bx, y, bw, r.Item1 == LabelNames[0] ? Theme.Bright : Theme.Text);
+                        LayoutBody(g, r.Item1, r.Item2, bx, y, bw, fp ? Theme.Sleep : r.Item1 == LabelNames[0] ? Theme.Bright : Theme.Text);
                         y += h + RowGap;
                     }
-                    using (var pen = new Pen(fg, 3f)) g.DrawLine(pen, DetailX + 16, top + rowH + 6, DetailX + 16, top + heights[i] - 14);
+                    using (var pen = new Pen(sus ? Theme.SuspectBar : fg, 3f)) g.DrawLine(pen, DetailX + 16, top + rowH + 6, DetailX + 16, top + heights[i] - 14);
                 }
 
                 using (var sep = new Pen(Theme.Separator))
@@ -912,18 +1020,33 @@ namespace RansomwareChecker
                     f.Rank = Finding.RankOf(f.Severity);
                     f.Split();
                     CheckReasons.Apply(f);
+                    Marks.Apply(f);
                     r.Findings.Add(f);
                 }
             if (root.TryGetValue("Notes", out no))
                 foreach (var d in List(no)) r.Notes.Add(S(d, "Check") + ": " + S(d, "Message"));
-            r.Findings.Sort((a, b) => b.Rank != a.Rank ? b.Rank.CompareTo(a.Rank) : string.Compare(a.Category, b.Category, StringComparison.OrdinalIgnoreCase));
+            // Snoozed findings (false positive) go last
+            r.Findings.Sort((a, b) =>
+            {
+                bool fa = a.Mark == Marks.FalsePositive, fb = b.Mark == Marks.FalsePositive;
+                if (fa != fb) return fa ? 1 : -1;
+                return b.Rank != a.Rank ? b.Rank.CompareTo(a.Rank) : string.Compare(a.Category, b.Category, StringComparison.OrdinalIgnoreCase);
+            });
             return r;
         }
 
+        // Count per severity without findings marked as false positive
         public int Count(string sev)
         {
             int n = 0;
-            foreach (var f in Findings) if (f.Severity == sev) n++;
+            foreach (var f in Findings) if (f.Severity == sev && f.Mark != Marks.FalsePositive) n++;
+            return n;
+        }
+
+        public int CountMarked(int mark)
+        {
+            int n = 0;
+            foreach (var f in Findings) if (f.Mark == mark) n++;
             return n;
         }
     }
@@ -980,6 +1103,7 @@ namespace RansomwareChecker
         FindingList list;
         TextBox search;
         readonly List<SeverityChip> chips = new List<SeverityChip>();
+        SeverityChip chipFp, chipSus;   // show only findings marked as false positive / suspicious (off = all)
         System.Windows.Forms.Timer ticker;
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -991,6 +1115,7 @@ namespace RansomwareChecker
             reportsDir = Path.Combine(appDir, "Reports");
             CheckReasons.Load(Path.Combine(appDir, @"config\check_reasons.json"));
             CheckReasons.LoadRemediation(Path.Combine(appDir, @"config\remediation.json"));
+            Marks.Load(Path.Combine(appDir, "marks.json"));
             LoadSettings();
             InitWindow();
             BuildUi();
@@ -1094,6 +1219,7 @@ namespace RansomwareChecker
             SuspendLayout();
             while (Controls.Count > 0) { var c = Controls[0]; Controls.RemoveAt(0); c.Dispose(); }
             chips.Clear();
+            chipFp = chipSus = null;
             BackColor = Theme.Back;
             ForeColor = Theme.Text;
             ApplyTitleBarTheme();
@@ -1155,6 +1281,14 @@ namespace RansomwareChecker
                 chips.Add(chip);
                 chipPanel.Controls.Add(chip);
             }
+            chipFp = new SeverityChip("False positive") { On = false, Margin = new Padding(12, 4, 8, 0) };
+            chipSus = new SeverityChip("Suspicious") { On = false };
+            chipFp.Toggled += delegate { if (chipFp.On) chipSus.On = false; ApplyFilter(); };
+            chipSus.Toggled += delegate { if (chipSus.On) chipFp.On = false; ApplyFilter(); };
+            tips.SetToolTip(chipFp, "Show only findings marked as false positive");
+            tips.SetToolTip(chipSus, "Show only findings marked as suspicious");
+            chipPanel.Controls.Add(chipFp);
+            chipPanel.Controls.Add(chipSus);
             search = new TextBox { Dock = DockStyle.Fill, BorderStyle = BorderStyle.None,
                 BackColor = Theme.Input, ForeColor = Theme.Text, Font = new Font("Consolas", 10.5F) };
             search.TextChanged += delegate { ApplyFilter(); };
@@ -1168,7 +1302,11 @@ namespace RansomwareChecker
             searchWrap.Controls.Add(frame);
             filterBar.Controls.Add(chipPanel);
             filterBar.Controls.Add(searchWrap);
+            EventHandler fitSearch = delegate { searchWrap.Width = Math.Max(150, Math.Min(320, filterBar.ClientSize.Width - filterBar.Padding.Horizontal - chipPanel.Width - 16)); };
+            filterBar.Resize += fitSearch;
+            chipPanel.SizeChanged += fitSearch;
             list = new FindingList { Dock = DockStyle.Fill };
+            list.MarksChanged += delegate { OnMarksChanged(); };
             content.Controls.Add(list);
             content.Controls.Add(new Panel { Dock = DockStyle.Top, Height = 1, BackColor = Theme.Border });
             content.Controls.Add(filterBar);
@@ -1256,6 +1394,8 @@ namespace RansomwareChecker
         void RefreshAll()
         {
             foreach (var c in chips) c.Count = report == null ? 0 : report.Count(c.Severity);
+            chipFp.Count = report == null ? 0 : report.CountMarked(Marks.FalsePositive);
+            chipSus.Count = report == null ? 0 : report.CountMarked(Marks.Suspicious);
             UpdateHero();
             ApplyFilter();
             btnRun.Text = running ? "Stop check" : "Run check again";
@@ -1293,6 +1433,8 @@ namespace RansomwareChecker
             string sub = string.Format("{0}  ·  {1}  ·  {2:0} s  ·  last {3} days{4}{5}",
                 report.Computer, report.ReportTime, report.Duration, report.WindowDays,
                 report.Elevated ? "" : "  ·  NOT elevated", report.Quick ? "  ·  quick" : "");
+            int fps = report.CountMarked(Marks.FalsePositive);
+            if (fps > 0) sub += "  ·  " + fps + " false positive";
             if (reportIsPrevious) sub = "Previous report  ·  " + sub;
             if (runError != null) sub = runError + "  ·  showing " + sub;
             lblSub.Text = sub;
@@ -1311,6 +1453,8 @@ namespace RansomwareChecker
                 foreach (var f in report.Findings)
                 {
                     if (!on.Contains(f.Severity)) continue;
+                    if (chipFp != null && chipFp.On && f.Mark != Marks.FalsePositive) continue;
+                    if (chipSus != null && chipSus.On && f.Mark != Marks.Suspicious) continue;
                     if (q.Length > 0 && !(Has(f.Item, q) || Has(f.Category, q) || Has(f.Details, q) || Has(f.Mitre, q) || Has(f.Severity, q))) continue;
                     shown.Add(f);
                 }
@@ -1319,7 +1463,17 @@ namespace RansomwareChecker
                            : total == 0 ? "No findings - nothing suspicious was found." : "No findings match the filter.";
             list.SetItems(shown);
             lblListTitle.Text = "// FINDINGS" + (report == null ? "" : "  (" + shown.Count + (shown.Count == total ? "" : " of " + total) + ")")
-                              + "   ·   click a row for details, right-click to copy";
+                              + "   ·   click a row for details, right-click to copy or mark";
+        }
+
+        // A mark changed in the list: apply it to all findings with the same key, update counts and headline, keep the scroll position
+        void OnMarksChanged()
+        {
+            if (report == null) return;
+            foreach (var f in report.Findings) Marks.Apply(f);
+            var pos = list.AutoScrollPosition;
+            RefreshAll();
+            list.AutoScrollPosition = new Point(-pos.X, -pos.Y);
         }
 
         static bool Has(string s, string q)

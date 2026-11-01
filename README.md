@@ -1,4 +1,4 @@
-# RansomwareChecker v. 1.1.0
+# RansomwareChecker v. 1.2.0
 
 A portable Windows tool for **fast triage after a ransomware attack**. It looks for persistence, post-exploitation
 tools, weakened security settings and traces of exfiltration, then writes a report and a recommended remediation plan.
@@ -46,6 +46,7 @@ These files must stay together in one folder:
 | `RansomwareChecker.ps1` | check engine (the app runs it) |
 | `config\` | indicators, reasons for checks, remediation steps |
 | `RansomwareChecker.ini` | settings (created automatically if missing) |
+| `marks.json` | false positive / suspicious marks from the app (created on the first mark) |
 | `Run-RansomwareChecker.bat` | optional: run the script without the app |
 
 ## Usage
@@ -56,8 +57,13 @@ Start `RansomwareChecker.exe` and confirm the administrator prompt. The app show
 runs a new check. Further checks run only on demand (**Run check again**).
 
 - Filter by **High / Medium / Low / Info** and search the findings.
+- **False positive** / **Suspicious** filters show only findings with that mark (one at a time; combined with the severity filter and search).
 - Click a finding to expand it: details, *Flagged because*, *Why checked*, *Remediation*, MITRE technique, category and time.
 - Right-click to copy a finding, copy all findings, or expand / collapse all.
+- Right-click → **Mark as false positive** snoozes a finding: its text turns dark, it moves to the end of the list in the
+  next report and it no longer counts towards the severity counts and the headline. **Mark as suspicious** highlights
+  the row in light red. Choosing the same item again removes the mark. Marks are kept in `marks.json` next to the exe
+  (key = category + item), so a finding keeps its mark in later reports. They affect only the app, not the HTML report.
 - **Remediation plan**, **HTML report** and **Report folder** open the outputs of the shown report.
 - *Coverage notes* in the footer list anything that could not be checked.
 
@@ -230,6 +236,17 @@ Rebuild after every change of the script or the pinned config files.
 - Comparing two runs (baseline diff)
 
 ## Changelog
+
+### 1.2.0
+
+Analyst marks in the desktop app.
+
+- Right-click a finding: **Mark as false positive** snoozes the detection (dimmed text, sorted last, not counted in
+  the severity counts and the headline); **Mark as suspicious** highlights the row in muted red. Choosing the same
+  item again removes the mark; the two marks exclude each other.
+- Marks are kept in `marks.json` next to the exe (key = category + item), so findings keep their marks in later reports.
+- New **False positive** / **Suspicious** filter chips show only the marked findings (combined with severity filter and search).
+- Expanded findings show a *Marked* row; copied findings include the mark.
 
 ### 1.1.0
 
