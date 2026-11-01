@@ -23,7 +23,7 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("RansomwareChecker")]
 [assembly: AssemblyProduct("RansomwareChecker")]
-[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyVersion("1.2.1.0")]
 
 namespace RansomwareChecker
 {
@@ -54,7 +54,7 @@ namespace RansomwareChecker
     static class App
     {
         public const string Name = "RansomwareChecker";
-        public const string Version = "1.2.0";
+        public const string Version = "1.2.1";
         public static readonly Color Accent = Color.FromArgb(210, 210, 210);     // retro off-white (softer contrast)
         public static readonly Color AccentHover = Color.FromArgb(185, 185, 185);
         public static readonly Color AccentDown = Color.FromArgb(150, 150, 150);

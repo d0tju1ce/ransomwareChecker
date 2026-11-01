@@ -1,4 +1,4 @@
-# RansomwareChecker v. 1.2.0
+# RansomwareChecker v. 1.2.1
 
 A portable Windows tool for **fast triage after a ransomware attack**. It looks for persistence, post-exploitation
 tools, weakened security settings and traces of exfiltration, then writes a report and a recommended remediation plan.
@@ -242,6 +242,12 @@ that the exe and the script have the same version and valid signatures, and leav
 
 ## Changelog
 
+### 1.2.1
+
+- Marks are stored per computer. Before, `marks.json` travelled with a copied tool folder and a false positive marked
+  on one computer snoozed the same finding on another computer. Marks from 1.2.0 are assigned to the computer they were made on.
+- `src\make_dist.ps1` builds a clean distribution ZIP without local data (marks, settings, reports).
+
 ### 1.2.0
 
 Analyst marks in the desktop app.
@@ -249,11 +255,9 @@ Analyst marks in the desktop app.
 - Right-click a finding: **Mark as false positive** snoozes the detection (dimmed text, sorted last, not counted in
   the severity counts and the headline); **Mark as suspicious** highlights the row in muted red. Choosing the same
   item again removes the mark; the two marks exclude each other.
-- Marks are kept in `marks.json` next to the exe, separately for each computer (computer + category + item): findings
-  keep their marks in later reports of the same computer, and a copy of the tool taken to another computer hides nothing there.
+- Marks are kept in `marks.json` next to the exe (key = category + item), so findings keep their marks in later reports.
 - New **False positive** / **Suspicious** filter chips show only the marked findings (combined with severity filter and search).
 - Expanded findings show a *Marked* row; copied findings include the mark.
-- `src\make_dist.ps1` builds a clean distribution ZIP without local data (marks, settings, reports).
 
 ### 1.1.0
 
