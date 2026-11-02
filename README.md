@@ -1,4 +1,4 @@
-# RansomwareChecker v. 1.2.1
+# RansomwareChecker v. 1.2.2
 
 A portable Windows tool for **fast triage after a ransomware attack**. It looks for persistence, post-exploitation
 tools, weakened security settings and traces of exfiltration, then writes a report and a recommended remediation plan.
@@ -241,6 +241,12 @@ that the exe and the script have the same version and valid signatures, and leav
 - Comparing two runs (baseline diff)
 
 ## Changelog
+
+### 1.2.2
+
+- Fixed: on computers with diacritics in the path (e.g. in the user name) the app reported *Check did not finish -
+  the script did not produce a report* although the report was written. The script now writes its output for the app in
+  UTF-8 and the app reads it as UTF-8; as a fallback the app opens the newest report written during the run.
 
 ### 1.2.1
 

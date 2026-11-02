@@ -23,7 +23,7 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("RansomwareChecker")]
 [assembly: AssemblyProduct("RansomwareChecker")]
-[assembly: AssemblyVersion("1.2.1.0")]
+[assembly: AssemblyVersion("1.2.2.0")]
 
 namespace RansomwareChecker
 {
@@ -54,7 +54,7 @@ namespace RansomwareChecker
     static class App
     {
         public const string Name = "RansomwareChecker";
-        public const string Version = "1.2.1";
+        public const string Version = "1.2.2";
         public static readonly Color Accent = Color.FromArgb(210, 210, 210);     // retro off-white (softer contrast)
         public static readonly Color AccentHover = Color.FromArgb(185, 185, 185);
         public static readonly Color AccentDown = Color.FromArgb(150, 150, 150);
@@ -1577,6 +1577,24 @@ namespace RansomwareChecker
             if (p != null) try { if (!p.HasExited) p.Kill(); } catch { }
         }
 
+        // Newest Reports\<PC>_<time> folder with findings.json written after the given time (null if none)
+        string NewestReportSince(DateTime since)
+        {
+            try
+            {
+                if (!Directory.Exists(reportsDir)) return null;
+                DirectoryInfo best = null;
+                foreach (var d in new DirectoryInfo(reportsDir).GetDirectories())
+                {
+                    var json = new FileInfo(Path.Combine(d.FullName, "findings.json"));
+                    if (!json.Exists || json.LastWriteTime < since) continue;
+                    if (best == null || json.LastWriteTime > new FileInfo(Path.Combine(best.FullName, "findings.json")).LastWriteTime) best = d;
+                }
+                return best == null ? null : best.FullName;
+            }
+            catch { return null; }
+        }
+
         void RunWorker()
         {
             string error = null;
@@ -1589,7 +1607,9 @@ namespace RansomwareChecker
                 var psi = new ProcessStartInfo(PowerShellPath(), args)
                 {
                     UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = appDir,
-                    RedirectStandardOutput = true, RedirectStandardError = true
+                    RedirectStandardOutput = true, RedirectStandardError = true,
+                    // the script switches its redirected output to UTF-8 (paths with diacritics)
+                    StandardOutputEncoding = new UTF8Encoding(false), StandardErrorEncoding = new UTF8Encoding(false)
                 };
                 using (var p = new Process { StartInfo = psi })
                 {
@@ -1626,10 +1646,13 @@ namespace RansomwareChecker
                         try { if (reportLine != null) full = Path.GetFullPath(reportLine); } catch { }
                         if (full != null && full.StartsWith(Path.GetFullPath(reportsDir).TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase)
                             && File.Exists(Path.Combine(full, "findings.json"))) folder = full;
-                        else
+                        // Fallback: the "Report:" line could not be used -> newest report in Reports written during this run
+                        if (folder == null) folder = NewestReportSince(runStarted.AddSeconds(-5));
+                        if (folder == null)
                         {
                             string err = errText.ToString().Trim();
-                            error = "The script did not produce a report (exit code " + p.ExitCode + ")" + (err.Length > 0 ? ": " + FirstLine(err) : ".");
+                            error = "The script did not produce a report (exit code " + p.ExitCode + ")" + (err.Length > 0 ? ": " + FirstLine(err) : ".")
+                                  + (reportLine != null ? " Script reported: " + reportLine : "");
                             if (err.IndexOf("digitally signed", StringComparison.OrdinalIgnoreCase) >= 0 || err.IndexOf("PSSecurityException", StringComparison.OrdinalIgnoreCase) >= 0)
                                 error += " Group Policy enforces an execution policy (AllSigned/RemoteSigned) that overrides -ExecutionPolicy Bypass:"
                                        + " import cert\\RansomwareChecker.cer into Trusted Publishers and Trusted Root, and unblock the downloaded files (Unblock-File).";
