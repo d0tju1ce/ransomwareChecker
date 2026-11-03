@@ -51,7 +51,7 @@ $ProgressPreference    = 'SilentlyContinue'
 # Output read by the app (redirected): UTF-8, so paths with diacritics arrive intact. An interactive console keeps its code page.
 if ([Console]::IsOutputRedirected) { try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false) } catch { } }
 
-$script:Version   = '1.2.2'
+$script:Version   = '1.2.3'
 $script:Root      = $PSScriptRoot
 $script:Since     = (Get-Date).AddDays(-$DaysBack)
 $script:Findings  = New-Object System.Collections.Generic.List[object]
@@ -82,8 +82,11 @@ function Add-Finding {
         [Parameter(Mandatory)][string]$Item,
         [string]$Details = '',
         [string]$Mitre = '',
-        [string]$Timestamp = ''
+        [string]$Timestamp = '',
+        # identity of the finding for analyst marks in the app: Item without parts that change between runs (PID, counts)
+        [string]$Key = ''
     )
+    if ($Key.Length -gt 300) { $Key = $Key.Substring(0, 300) }
     $script:Findings.Add([pscustomobject][ordered]@{
         Severity  = $script:SevNames[[Math]::Min([Math]::Max($Level, 0), 3)]
         Rank      = $Level
@@ -92,6 +95,7 @@ function Add-Finding {
         Details   = $Details
         Mitre     = $Mitre
         Timestamp = $Timestamp
+        Key       = if ($Key) { $Key } else { $Item }
     })
 }
 
@@ -751,7 +755,8 @@ function Test-RunningProcesses {
         if ($conns.ContainsKey([int]$p.ProcessId)) { $net = ' | external connections: ' + (($conns[[int]$p.ProcessId] | Select-Object -Unique) -join ', ') }
         $c = if ($cmd.Length -gt 500) { $cmd.Substring(0, 500) + '...' } else { $cmd }
         Add-Finding -Category $cat -Level $a.Level -Item "$($p.Name) (PID $($p.ProcessId), PPID $($p.ParentProcessId))" `
-            -Details ((Join-Details $c $a.Reasons) + $net) -Mitre 'T1059 / T1218' -Timestamp (Format-Time $p.CreationDate)
+            -Details ((Join-Details $c $a.Reasons) + $net) -Mitre 'T1059 / T1218' -Timestamp (Format-Time $p.CreationDate) `
+            -Key "$($p.Name) | $cmd"
     }
 }
 
@@ -883,7 +888,7 @@ function Test-RecoveryInhibition {
             Add-Finding -Category $cat -Level 1 -Item 'No volume shadow copies' -Details 'Deleted (vssadmin/wmic shadowcopy delete) or never enabled' -Mitre 'T1490'
         } else {
             $latest = ($sc | Sort-Object InstallDate -Descending | Select-Object -First 1).InstallDate
-            Add-Finding -Category $cat -Level 0 -Item "$($sc.Count) shadow copies present" -Details "Newest: $(Format-Time $latest) - preserve them!" -Mitre 'T1490'
+            Add-Finding -Category $cat -Level 0 -Item "$($sc.Count) shadow copies present" -Details "Newest: $(Format-Time $latest) - preserve them!" -Mitre 'T1490' -Key 'shadow copies present'
         }
     } catch { Add-Note 'Shadow copies' $_.Exception.Message }
 
@@ -991,7 +996,8 @@ function Test-EventLogs {
             $first = ($g.Group | Sort-Object Time | Select-Object -First 1).Time
             $last  = ($g.Group | Sort-Object Time | Select-Object -Last 1).Time
             Add-Finding -Category "$($sev): Brute force (4625)" -Level $lvl -Item "$($g.Count) failed logons from $($g.Name)" `
-                -Details "Accounts: $users; $(Format-Time $first) - $(Format-Time $last)" -Mitre 'T1110 / T1133' -Timestamp (Format-Time $first)
+                -Details "Accounts: $users; $(Format-Time $first) - $(Format-Time $last)" -Mitre 'T1110 / T1133' -Timestamp (Format-Time $first) `
+                -Key "failed logons from $($g.Name)"
         }
     }
 
@@ -1111,7 +1117,7 @@ function Test-EventLogs {
         $short = if ($hostApp.Length -gt 600) { $hostApp.Substring(0, 600) + '...' } else { $hostApp }
         Add-Finding -Category "$($sev): PowerShell host (400)" -Level ([Math]::Max($a.Level, 2)) -Item "PowerShell started $($o.Count)x" `
             -Details (Join-Details ("{0}  (first {1}, last {2})" -f $short, (Format-Time $o.First), (Format-Time $o.Last)) (@($a.Reasons) + $hits)) `
-            -Mitre 'T1059.001' -Timestamp (Format-Time $o.First)
+            -Mitre 'T1059.001' -Timestamp (Format-Time $o.First) -Key "PowerShell host | $hostApp"
     }
 
     # Scheduled task registration
@@ -1245,7 +1251,7 @@ function Test-PowerShellHistory {
             $n++
             if ($n -gt 50) { Add-Note 'PSReadLine' "More than 50 hits in $hist - review the file manually"; break }
             Add-Finding -Category $cat -Level 3 -Item "$($u.Name) line $lineNo" -Details (Join-Details $line (@($hits) + @($hit))) `
-                -Mitre 'T1059.001' -Timestamp (Format-Time (Get-Item -LiteralPath $hist).LastWriteTime)
+                -Mitre 'T1059.001' -Timestamp (Format-Time (Get-Item -LiteralPath $hist).LastWriteTime) -Key "$($u.Name) | $line"
         }
     }
 }
@@ -1468,7 +1474,7 @@ function Test-RansomNotes {
         $lvl = if ($g.Count -ge 3) { 3 } else { 2 }
         Add-Finding -Category $cat -Level $lvl -Item "$($g.Name) ($($g.Count)x)" `
             -Details "Earliest: $($first.FullName) @ $(Format-Time $first.CreationTime) - use as pivot point for the MFT timeline. Samples: $sample" `
-            -Mitre 'T1486' -Timestamp (Format-Time $first.CreationTime)
+            -Mitre 'T1486' -Timestamp (Format-Time $first.CreationTime) -Key $g.Name
     }
 }
 
@@ -1524,7 +1530,11 @@ function Split-FindingDetails {
     if (-not $Details) { return $o }
     $open = $Details.LastIndexOf('  [')
     if ($open -ge 0) {
-        $close = $Details.IndexOf(']', $open)
+        $close = -1
+        for ($c = $Details.IndexOf(']', $open); $c -gt $open; $c = $Details.IndexOf(']', $c + 1)) {
+            $rest = $Details.Substring($c + 1).TrimStart()
+            if ($rest.Length -eq 0 -or $rest.StartsWith('|')) { $close = $c; break }
+        }
         if ($close -gt $open) {
             $o.Main = $Details.Substring(0, $open).Trim()
             $o.Reasons = @($Details.Substring($open + 3, $close - $open - 3) -split '; ' | Where-Object { $_.Trim() })
@@ -1833,6 +1843,13 @@ $hostInfo = [pscustomobject][ordered]@{
     Tool         = "RansomwareChecker $($script:Version)"
 }
 
+# Remediation plan next to the Reports folder: <parent of OutputPath>\Remediation\<same folder name as the report>.
+# Before the report files, so that a failure note gets into findings.json and report.html.
+if (-not $RemediationPath) { $RemediationPath = Join-Path (Split-Path -Parent ([IO.Path]::GetFullPath($OutputPath))) 'Remediation' }
+$remDir = Join-Path $RemediationPath (Split-Path -Leaf $outDir)
+$remHtml = $null
+try { $remHtml = Export-Remediation -Dir $remDir -HostInfo $hostInfo -Findings $sorted } catch { Add-Note 'Remediation' "failed: $($_.Exception.Message)" }
+
 # CSV: cells come from attacker-controlled text - neutralise formulas (=, +, -, @, tab, CR) for Excel
 $csvSafe = { param($v) $s = [string]$v; if ($s -match '^[=+\-@\t\r]') { "'" + $s } else { $s } }
 $sorted | ForEach-Object {
@@ -1841,16 +1858,11 @@ $sorted | ForEach-Object {
         Details = & $csvSafe $_.Details; Mitre = $_.Mitre; Timestamp = $_.Timestamp
     }
 } | Export-Csv -LiteralPath (Join-Path $outDir 'findings.csv') -NoTypeInformation -Encoding UTF8
-[pscustomobject]@{ Host = $hostInfo; Findings = @($sorted | Select-Object Severity, Category, Item, Details, Mitre, Timestamp); Notes = $script:Notes } |
+[pscustomobject]@{ Host = $hostInfo; Findings = @($sorted | Select-Object Severity, Category, Item, Details, Mitre, Timestamp, Key); Notes = $script:Notes } |
     ConvertTo-Json -Depth 5 | Out-File -LiteralPath (Join-Path $outDir 'findings.json') -Encoding UTF8
 $htmlPath = Join-Path $outDir 'report.html'
 if (-not $NoHtml) { Export-HtmlReport -Path $htmlPath -HostInfo $hostInfo -Findings $sorted -Notes $script:Notes }
 
-# Remediation plan next to the Reports folder: <parent of OutputPath>\Remediation\<same folder name as the report>
-if (-not $RemediationPath) { $RemediationPath = Join-Path (Split-Path -Parent ([IO.Path]::GetFullPath($OutputPath))) 'Remediation' }
-$remDir = Join-Path $RemediationPath (Split-Path -Leaf $outDir)
-$remHtml = $null
-try { $remHtml = Export-Remediation -Dir $remDir -HostInfo $hostInfo -Findings $sorted } catch { Add-Note 'Remediation' "failed: $($_.Exception.Message)" }
 
 $h = @($sorted | Where-Object Rank -ge 3).Count
 $m = @($sorted | Where-Object Rank -eq 2).Count
@@ -1869,8 +1881,8 @@ if ($h -gt 0) { exit 2 } elseif ($m -gt 0) { exit 1 } else { exit 0 }
 # SIG # Begin signature block
 # MIIdowYJKoZIhvcNAQcCoIIdlDCCHZACAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAnDUtljL3bLseU
-# OOl97iZRD2SqbFbzyTxYLC32iqyHJaCCF2AwggQiMIICiqADAgECAhB1VkCOhmLH
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCdunhmNKyH/rtT
+# NESjCuEj5IxDW+j00BCAf9ubIsAU6aCCF2AwggQiMIICiqADAgECAhB1VkCOhmLH
 # gU1PkVGYpUTbMA0GCSqGSIb3DQEBCwUAMCkxJzAlBgNVBAMMHlJhbnNvbXdhcmVD
 # aGVja2VyIENvZGUgU2lnbmluZzAeFw0yNjEwMzExNzM3MThaFw0zMTEwMzExNzQ3
 # MTZaMCkxJzAlBgNVBAMMHlJhbnNvbXdhcmVDaGVja2VyIENvZGUgU2lnbmluZzCC
@@ -1999,31 +2011,31 @@ if ($h -gt 0) { exit 2 } elseif ($m -gt 0) { exit 1 } else { exit 0 }
 # ZWNrZXIgQ29kZSBTaWduaW5nAhB1VkCOhmLHgU1PkVGYpUTbMA0GCWCGSAFlAwQC
 # AQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwG
 # CisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZI
-# hvcNAQkEMSIEIMEI8fxSN+xVrxHHWUbkpoS1w00Hy5LAQ96JVEwy/nQ+MA0GCSqG
-# SIb3DQEBAQUABIIBgIelvVuFPfz6VJ+qVF91lAyFWiy33giUhiC/PHZJlNdo8HHs
-# Y98ycfJkROHqjWOh2Bs0yT2x6fxyBoNerc+FClFJptCtsAx/A/cUtyLWG3RzdC8J
-# cj4JCOQmRJi+CrExTv/elqfBBVoLjMJklPpciMrBy4cKn6tmgUNNb7GXcYREE2j8
-# TH3EgNQeZnNTVBgiKrlJCsFYZr8N9esqPr95NVbS/OYmyAnMlhnjCauxemzvvWlr
-# nQyqeaHE+qzzJp1p14r3LPJS/IQEqRYSXCXdqgZ+7OCKrcP0UUgouviVjf6RDdOh
-# hp2P42pj1KTDr/zd+7+4hwB1jPk5nLYXYG/PCBAvcWtu/mf97wuumGH2ncBEsFjk
-# NfVd6bRZ/jTwG2NZYv7bvOh6HTqkGAboD0+5wNFhqSRhuLMKSCg0ZH/0G/iIcSR1
-# lQAL87oADl9QaXxcQdZKMoXDZep0zKOpmEAngtdCyXgHMygZe1peFvQlmqSMKUej
-# IG1BA+fgQ8pK3NFyFKGCAyYwggMiBgkqhkiG9w0BCQYxggMTMIIDDwIBATB9MGkx
+# hvcNAQkEMSIEIEbcb7GIizhqe2GvYXVnXCkOWRT/TOPePI6Pri4RyVYfMA0GCSqG
+# SIb3DQEBAQUABIIBgHobgOdTWMgw2HmWTQzce4mIGcByba0rzIMYucRve9Fkhp3K
+# T2N+CXuy+eM5qmh/tpNWHzgJsUi8M7BgJV2iwXiq6XXTT1J/hIgqcbHMmGW2OoI1
+# x4WCwo4dWI0JfrF4PP8T63eOSF7vB6ujcP2MKEoTVdvvwY58F2OhBg1BUxlULKK1
+# VTdsIu+FNm05w1sFXtwVe1V6sZTFuoSlSO87XVaQeoez36vejWAuXhi6ku+vu39v
+# CbtFzHwIMBEb9yDrYhIflmY5fJgZNUs7TrGV9jVXxISd+UL32Lcs1L5bNvbsS5MJ
+# RAQQm+6utkWWRjBnSO1Db0vAbqKvXw9au09z0aXjMDUz78PxLgb9DqF+lyU8hjgI
+# SPFW3NsP7PwqWROmZoL+Ug98BDonyWNDoAx+ThKfdNtc6h0zYFj3IRtim72zcncJ
+# 0tOkeUZ2Q72mSCYW/MTtZHdrG7kDrcqvWYdDtIvutLzvFGTUHPAwUKeQaFRLOliM
+# 0MAR4fnJJBSJ/fGpLaGCAyYwggMiBgkqhkiG9w0BCQYxggMTMIIDDwIBATB9MGkx
 # CzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5jLjFBMD8GA1UEAxM4
 # RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNBNDA5NiBTSEEyNTYg
 # MjAyNSBDQTECEAhP3DNPfkVO28MPj/mSGDUwDQYJYIZIAWUDBAIBBQCgaTAYBgkq
-# hkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEPFw0yNjExMDIwNzUw
-# NDNaMC8GCSqGSIb3DQEJBDEiBCB9Gu7FKG9EHVYN7UsyXSGaOw7VLm/5qDBrkjOn
-# nyw/JTANBgkqhkiG9w0BAQEFAASCAgAbSDJrf0FYIR7hmN+6BnFpOSvsFvXt+2iA
-# uwIr+8nmDSm+d0hNimJDGVTjw78lDw+qNZInGKBDzMj8qt04nHS+6MN2oW7yaL3H
-# krVLs+06qAqf1o9WlHAXsbzaXZ/1arxjIeTAr9g4Ip/raiYOLuudjiABKmOIKJN1
-# haNdxYp3KO2R1jZ2aMLcC/afqjwnsWSpLY+fTnCCM1nfl5w/NWaZge6Mv4fs7XfZ
-# yRXiSTP2BiMz+5hlrXy1Lbr8rxA8XnGvdyWXIvrQamtVZrlmb7ozbhCl3MCExDl4
-# rUsekYx6/wK1ZvOAP6hAzT2/EQY3A40DF9XbRiOxqTDECUJVDQCK8gdFA6LE8wnp
-# 99XjmhUVHk1Mmv/+Q/W48AKBz2Wkkxh0RP5SmPDEtz2VA0Pj8jDeEQp+ZVsbJUWE
-# 2neyyg1VQ+aDUCGxp/axtq3U9VbMZFoqvM3AkiPAbTj/l4Ltvi4YZ4KtIQDmsZN8
-# RWIf2gzfaCokKuDqKin+LI9QNLGyEYFPjAUWzpemTJdpN47FluMyj/gycUcZx6Rq
-# BZT9XvfejMtsXPJBnvVXO4oqzTiiyGL5V4sVjafWHZMrtkyJiStOyVvS2UllSko6
-# 897hF8pRfChMhtLHBjMA0cqJ33ri5BSNZYK5a+/UB20DKUJX2OtnrRCyJdEJKYQB
-# oBYSZaJdjQ==
+# hkiG9w0BCQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEPFw0yNjExMDMxOTQ2
+# NDFaMC8GCSqGSIb3DQEJBDEiBCAxJtwtyrtpAuEkYoLuHT3J9PnSsyXlOuTIYUxZ
+# oEFOBjANBgkqhkiG9w0BAQEFAASCAgA+LVrvOg353a43VW9Yfc+WZgn5xnF3JTBb
+# 9o+k47naTB+n28mEQsUIKvaTJfAx8UK3lXB8ipgGkIahgIFEGo3SCz4dmbbh4jtg
+# 8G1qpQ1Ah0lWruNXGOnnsrQxLFGQF1GJIW30UGpNAaLFj+60XeZOF3HKWxGbDrI7
+# E7Tyy/EBtU+/CAo0rRpBmsGCprHh5pzQEUOMuEgMioF2dbOb2MFfDn0Bv1Wlt/B2
+# SsX6KK2L7NnloIc1BTA+9NSf8OAPusVgMBWp/tTBPvCWwqMFNqhAUtsaksRqDALb
+# rJZSODZxeM7Q3GbHK3+V2QF8/dB8C+JpZDv5AEkUQnuj6D6tm6VO87S7+Ugy3Tad
+# c7UsJNvKe1wy1OPbZhtfG+U8G1nfr92gzbNaY9AIydcK0t3WsBNBlgogHT0XYNID
+# 6wcEL3j3vCqmvH4paVJSy6UtpnUgqGFclhfwb70f0Yn7/LLnZ6q7j3Pwo7R9SLoL
+# T5ptGOKgItBU9FTUzHLYhIwwaK0qQ+5tWSMIzWro1kcsWlD8OnUe/dwklXargGHJ
+# w6ch8T/GCjh5zPLZMRsXbOguv6RMMV1jauSvfMEtttCG5WL2ThuewONoaTBibDEp
+# ae5VJqZduYh3Iq1ujdyhJ9QPVVX/tQixCDisOxsbAzXBB/scRjMbCe7zjg1MK316
+# qbuESu9ncg==
 # SIG # End signature block

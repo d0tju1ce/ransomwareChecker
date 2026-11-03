@@ -1,4 +1,4 @@
-# RansomwareChecker v. 1.2.2
+# RansomwareChecker v. 1.2.3
 
 A portable Windows tool for **fast triage after a ransomware attack**. It looks for persistence, post-exploitation
 tools, weakened security settings and traces of exfiltration, then writes a report and a recommended remediation plan.
@@ -241,6 +241,23 @@ that the exe and the script have the same version and valid signatures, and leav
 - Comparing two runs (baseline diff)
 
 ## Changelog
+
+### 1.2.3
+
+- Marks are kept by a stable identity of the finding (without PID, counts or line numbers), so a finding marked as
+  false positive stays marked in the next report. Marks made with older versions still apply.
+- A High or Medium finding marked as false positive no longer turns the status green - the headline asks to review
+  the marks (marks.json is not covered by the integrity check).
+- An unreadable marks.json is renamed to marks.json.bad-<time> with a warning instead of being overwritten; marks are
+  written atomically. A 1.2.0 marks.json is converted once to the per-computer format.
+- The right-click menu acts on the finding it was opened on, even if the list is refreshed by a finished check.
+- The previous report is chosen by the time of its findings.json (reports of this computer first), so a copied tool
+  folder shows the right one; an unreadable report is skipped.
+- "Flagged because" is no longer cut at a "]" inside a reason (e.g. a regex keyword) - also in the HTML report.
+- A failure of the remediation export is now reported in the report notes.
+- The launcher elevates correctly from a path with an apostrophe.
+- Expanded rows no longer overlap when the scrollbar appears or disappears.
+- make_dist checks the packaged files against the hashes pinned in the exe.
 
 ### 1.2.2
 

@@ -7,10 +7,13 @@ set "SCRIPT=%~dp0RansomwareChecker.ps1"
 net session >nul 2>&1
 if %errorlevel% neq 0 (
     echo Requesting administrator rights...
+    rem path and arguments go through environment variables - an apostrophe or quote in them must not break the command
+    set "RC_SELF=%~f0"
+    set RC_ARGS=%*
     if "%~1"=="" (
-        powershell.exe -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+        powershell.exe -NoProfile -Command "Start-Process -FilePath $env:RC_SELF -Verb RunAs"
     ) else (
-        powershell.exe -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '%*' -Verb RunAs"
+        powershell.exe -NoProfile -Command "Start-Process -FilePath $env:RC_SELF -ArgumentList $env:RC_ARGS -Verb RunAs"
     )
     exit /b
 )

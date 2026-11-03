@@ -28,9 +28,13 @@ foreach ($i in 'RansomwareChecker.exe', 'RansomwareChecker.ps1', 'Run-Ransomware
     Copy-Item -LiteralPath (Join-Path $root $i) -Destination $stage -Recurse
 }
 
-# The copies must match the hashes pinned in the exe (script + config)
-foreach ($f in 'RansomwareChecker.ps1', 'config\indicators.json', 'config\remediation.json') {
-    if ((Get-FileHash -LiteralPath (Join-Path $root $f)).Hash -ne (Get-FileHash -LiteralPath (Join-Path $stage $f)).Hash) { throw "copy of $f differs" }
+# The copies must match the hashes pinned in the exe (src\Integrity.g.cs of the last build) - otherwise every user
+# of the package would get the "modified" integrity warning
+$pinned = [regex]::Matches([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'Integrity.g.cs')), '\{\s*@"([^"]+)",\s*"([0-9A-F]{64})"\s*\}')
+if ($pinned.Count -eq 0) { throw 'No pinned hashes found in src\Integrity.g.cs - run src\build.cmd first' }
+foreach ($p in $pinned) {
+    $f = $p.Groups[1].Value
+    if ((Get-FileHash -LiteralPath (Join-Path $stage $f)).Hash -ne $p.Groups[2].Value) { throw "$f does not match the hash pinned in the exe - run src\build.cmd again" }
 }
 
 # Entry names with "/" (ZipFile.CreateFromDirectory in .NET Framework writes "\", which other unzip tools misread)

@@ -23,7 +23,7 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("RansomwareChecker")]
 [assembly: AssemblyProduct("RansomwareChecker")]
-[assembly: AssemblyVersion("1.2.2.0")]
+[assembly: AssemblyVersion("1.2.3.0")]
 
 namespace RansomwareChecker
 {
@@ -54,7 +54,7 @@ namespace RansomwareChecker
     static class App
     {
         public const string Name = "RansomwareChecker";
-        public const string Version = "1.2.2";
+        public const string Version = "1.2.3";
         public static readonly Color Accent = Color.FromArgb(210, 210, 210);     // retro off-white (softer contrast)
         public static readonly Color AccentHover = Color.FromArgb(185, 185, 185);
         public static readonly Color AccentDown = Color.FromArgb(150, 150, 150);
@@ -406,7 +406,9 @@ namespace RansomwareChecker
         public bool Expanded;
         public int Mark;   // Marks.None / FalsePositive / Suspicious (marks.json)
         public string Computer = "";   // computer of the report; marks are kept per computer
-        public string Key { get { return Computer + "|" + Category + "|" + Item; } }
+        public string MarkId = "";     // "Key" from the script: Item without changing parts (PID, counts, line numbers)
+        public string Key { get { return Computer + "|" + Category + "|" + (MarkId.Length > 0 ? MarkId : Item); } }
+        public string ItemKey { get { return Computer + "|" + Category + "|" + Item; } }   // key of marks made before 1.2.3
 
         public static int RankOf(string sev)
         {
@@ -418,7 +420,12 @@ namespace RansomwareChecker
         {
             string d = Details ?? "";
             int open = d.LastIndexOf("  [", StringComparison.Ordinal);
-            int close = open >= 0 ? d.IndexOf(']', open) : -1;
+            int close = -1;
+            for (int c = open >= 0 ? d.IndexOf(']', open) : -1; c > open; c = d.IndexOf(']', c + 1))
+            {
+                string rest = d.Substring(c + 1).TrimStart();
+                if (rest.Length == 0 || rest.StartsWith("|")) { close = c; break; }
+            }
             if (open >= 0 && close > open)
             {
                 Main = d.Substring(0, open).Trim();
@@ -461,25 +468,44 @@ namespace RansomwareChecker
         static readonly Dictionary<string, int> map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         static string file;
 
+        // Set when marks.json could not be read; the file was renamed so that the next mark does not overwrite it
+        public static string LoadError;
+
         public static void Load(string path)
         {
             file = path;
             map.Clear();
+            LoadError = null;
+            if (!File.Exists(path)) return;
+            bool legacy = false;
             try
             {
-                if (!File.Exists(path)) return;
                 var root = new JavaScriptSerializer().DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
-                if (root == null) return;
+                if (root == null) throw new InvalidDataException("unexpected format");
                 foreach (var kv in root)
                 {
                     var perPc = kv.Value as Dictionary<string, object>;
                     if (perPc != null)
                         foreach (var m in perPc) Put(kv.Key + "|" + m.Key, m.Value);
                     else
+                    {
                         Put(Environment.MachineName + "|" + kv.Key, kv.Value);   // 1.2.0 format without computer = made on this computer
+                        legacy = true;
+                    }
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                map.Clear();
+                string bad = path + ".bad-" + DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                try { File.Move(path, bad); } catch { bad = null; }
+                LoadError = "marks.json could not be read (" + ex.Message + ")." +
+                    (bad != null ? " It was renamed to " + Path.GetFileName(bad) + " - the marks start empty." : " Marks will not be saved.");
+                if (bad == null) file = null;
+                return;
+            }
+            // 1.2.0 format: write it once in the per-computer format, so other computers do not take it over
+            if (legacy) { try { Save(); } catch { } }
         }
 
         static void Put(string key, object value)
@@ -492,16 +518,34 @@ namespace RansomwareChecker
         public static void Apply(Finding f)
         {
             int m;
-            f.Mark = map.TryGetValue(f.Key, out m) ? m : None;
+            f.Mark = map.TryGetValue(f.Key, out m) || map.TryGetValue(f.ItemKey, out m) ? m : None;
         }
 
         // Saves the new mark of a finding; on a write error the old mark stays and false is returned
         public static bool Set(Finding f, int mark)
         {
-            int old;
-            bool had = map.TryGetValue(f.Key, out old);
+            int old, oldItem;
+            bool had = map.TryGetValue(f.Key, out old), hadItem = map.TryGetValue(f.ItemKey, out oldItem);
+            map.Remove(f.ItemKey);   // a mark made on the Item text (before 1.2.3) is replaced by the stable key
             if (mark == None) map.Remove(f.Key); else map[f.Key] = mark;
             try
+            {
+                if (file == null) throw new IOException(LoadError ?? "no marks file");
+                Save();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                map.Remove(f.Key);
+                if (hadItem) map[f.ItemKey] = oldItem;
+                if (had) map[f.Key] = old;
+                MessageBox.Show("The mark could not be saved to " + (file ?? "marks.json") + ":\r\n" + ex.Message, App.Name, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+        }
+
+        static void Save()
+        {
             {
                 // key = "computer|category|item" (a computer name cannot contain "|") -> grouped by computer
                 var byPc = new SortedDictionary<string, List<KeyValuePair<string, int>>>(StringComparer.OrdinalIgnoreCase);
@@ -525,14 +569,10 @@ namespace RansomwareChecker
                     sb.Append("  }").Append(++p < byPc.Count ? ",\r\n" : "\r\n");
                 }
                 sb.Append("}\r\n");
-                File.WriteAllText(file, sb.ToString(), new UTF8Encoding(false));
-                return true;
-            }
-            catch (Exception ex)
-            {
-                if (had) map[f.Key] = old; else map.Remove(f.Key);
-                MessageBox.Show("The mark could not be saved to " + file + ":\r\n" + ex.Message, App.Name, MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return false;
+                // temp file first: an interrupted write must not destroy the existing marks
+                string tmp = file + ".tmp";
+                File.WriteAllText(tmp, sb.ToString(), new UTF8Encoding(false));
+                if (File.Exists(file)) File.Replace(tmp, file, null); else File.Move(tmp, file);
             }
         }
     }
@@ -553,7 +593,7 @@ namespace RansomwareChecker
                       fPill = AppFonts.Semibold(9.5F), fTitle = AppFonts.Semibold(10.5F), fMeta = AppFonts.Regular(10.5F), fBody = new Font("Consolas", 9.5F);
         public string EmptyText = "No findings to show.";
         readonly ContextMenuStrip menu = new ContextMenuStrip();
-        int menuIndex = -1;
+        Finding menuFinding;   // finding under the right click; the list may be replaced while the menu is open
 
         [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
         static extern int SetWindowTheme(IntPtr hWnd, string subAppName, string subIdList);
@@ -571,7 +611,7 @@ namespace RansomwareChecker
             menu.BackColor = Theme.Card;
             menu.ForeColor = Theme.Text;
             menu.ShowImageMargin = false;
-            menu.Items.Add("Copy finding", null, delegate { if (menuIndex >= 0 && menuIndex < items.Count) Copy(items[menuIndex].ToClipboardText()); });
+            menu.Items.Add("Copy finding", null, delegate { if (menuFinding != null) Copy(menuFinding.ToClipboardText()); });
             menu.Items.Add("Copy all shown findings", null, delegate
             {
                 var sb = new StringBuilder();
@@ -588,7 +628,7 @@ namespace RansomwareChecker
             menu.Items.Add(miSus);
             menu.Opening += delegate
             {
-                var f = menuIndex >= 0 && menuIndex < items.Count ? items[menuIndex] : null;
+                var f = menuFinding;
                 miFp.Text = f != null && f.Mark == Marks.FalsePositive ? "Unmark false positive" : "Mark as false positive";
                 miSus.Text = f != null && f.Mark == Marks.Suspicious ? "Unmark suspicious" : "Mark as suspicious";
             };
@@ -600,8 +640,8 @@ namespace RansomwareChecker
         // The same mark again = unmark; false positive and suspicious exclude each other
         void ToggleMark(int mark)
         {
-            if (menuIndex < 0 || menuIndex >= items.Count) return;
-            var f = items[menuIndex];
+            var f = menuFinding;
+            if (f == null) return;
             if (!Marks.Set(f, f.Mark == mark ? Marks.None : mark)) return;
             if (MarksChanged != null) MarksChanged(this, EventArgs.Empty);
             Relayout();
@@ -766,22 +806,29 @@ namespace RansomwareChecker
             layingOut = true;
             try
             {
-                tops = new int[items.Count];
-                heights = new int[items.Count];
-                int y = 0;
-                for (int i = 0; i < items.Count; i++)
+                // a second pass when setting the scroll size showed/hid the scrollbar (text is wrapped to the client width)
+                for (int pass = 0; pass < 2; pass++)
                 {
-                    tops[i] = y;
-                    heights[i] = rowH + (items[i].Expanded ? DetailHeight(items[i]) : 0);
-                    y += heights[i];
+                    int width = ClientSize.Width;
+                    tops = new int[items.Count];
+                    heights = new int[items.Count];
+                    int y = 0;
+                    for (int i = 0; i < items.Count; i++)
+                    {
+                        tops[i] = y;
+                        heights[i] = rowH + (items[i].Expanded ? DetailHeight(items[i]) : 0);
+                        y += heights[i];
+                    }
+                    AutoScrollMinSize = new Size(0, y);
+                    if (ClientSize.Width == width) break;
                 }
-                AutoScrollMinSize = new Size(0, y);
             }
             finally { layingOut = false; }
             Invalidate();
         }
 
         protected override void OnResize(EventArgs e) { base.OnResize(e); Relayout(); }
+        protected override void OnClientSizeChanged(EventArgs e) { base.OnClientSizeChanged(e); Relayout(); }
         protected override void OnScroll(ScrollEventArgs se) { base.OnScroll(se); Invalidate(); }
         protected override void OnMouseWheel(MouseEventArgs e) { base.OnMouseWheel(e); Invalidate(); }
 
@@ -812,7 +859,7 @@ namespace RansomwareChecker
             if (i < 0) return;
             if (e.Button == MouseButtons.Right)
             {
-                menuIndex = i;
+                menuFinding = items[i];
                 menu.Show(this, e.Location);
                 return;
             }
@@ -1043,23 +1090,35 @@ namespace RansomwareChecker
                 {
                     var f = new Finding { Severity = S(d, "Severity"), Category = S(d, "Category"), Item = S(d, "Item"),
                         Details = S(d, "Details"), Mitre = S(d, "Mitre"), Timestamp = S(d, "Timestamp"),
-                        Computer = r.Computer.Length > 0 ? r.Computer : Environment.MachineName };
+                        Computer = r.Computer.Length > 0 ? r.Computer : Environment.MachineName, MarkId = S(d, "Key") };
                     f.Rank = Finding.RankOf(f.Severity);
                     f.Split();
                     CheckReasons.Apply(f);
-                    Marks.Apply(f);
                     r.Findings.Add(f);
                 }
             if (root.TryGetValue("Notes", out no))
                 foreach (var d in List(no)) r.Notes.Add(S(d, "Check") + ": " + S(d, "Message"));
-            // Snoozed findings (false positive) go last
-            r.Findings.Sort((a, b) =>
+            return r;
+        }
+
+        // Applies the marks and sorts (snoozed findings last). UI thread only - Marks is not thread-safe.
+        public void ApplyMarks()
+        {
+            foreach (var f in Findings) Marks.Apply(f);
+            Findings.Sort((a, b) =>
             {
                 bool fa = a.Mark == Marks.FalsePositive, fb = b.Mark == Marks.FalsePositive;
                 if (fa != fb) return fa ? 1 : -1;
                 return b.Rank != a.Rank ? b.Rank.CompareTo(a.Rank) : string.Compare(a.Category, b.Category, StringComparison.OrdinalIgnoreCase);
             });
-            return r;
+        }
+
+        // High / Medium findings marked as false positive (they still keep the status at least at "warning")
+        public int CountSnoozed(string sev)
+        {
+            int n = 0;
+            foreach (var f in Findings) if (f.Severity == sev && f.Mark == Marks.FalsePositive) n++;
+            return n;
         }
 
         // Count per severity without findings marked as false positive
@@ -1143,6 +1202,7 @@ namespace RansomwareChecker
             CheckReasons.Load(Path.Combine(appDir, @"config\check_reasons.json"));
             CheckReasons.LoadRemediation(Path.Combine(appDir, @"config\remediation.json"));
             Marks.Load(Path.Combine(appDir, "marks.json"));
+            if (Marks.LoadError != null) MessageBox.Show(Marks.LoadError, App.Name, MessageBoxButtons.OK, MessageBoxIcon.Warning);
             LoadSettings();
             InitWindow();
             BuildUi();
@@ -1453,9 +1513,11 @@ namespace RansomwareChecker
                 return;
             }
             int h = report.Count("High"), m = report.Count("Medium");
-            statusIcon.State = h > 0 ? RunState.Problem : m > 0 ? RunState.Warning : RunState.Ok;
+            int snoozed = report.CountSnoozed("High") + report.CountSnoozed("Medium");
+            statusIcon.State = h > 0 ? RunState.Problem : m > 0 || snoozed > 0 ? RunState.Warning : RunState.Ok;
             lblHeadline.Text = "> " + (h > 0 ? h + (h == 1 ? " HIGH-SEVERITY FINDING" : " HIGH-SEVERITY FINDINGS")
                              : m > 0 ? m + (m == 1 ? " MEDIUM-SEVERITY FINDING" : " MEDIUM-SEVERITY FINDINGS")
+                             : snoozed > 0 ? snoozed + " HIGH/MEDIUM MARKED FALSE POSITIVE - REVIEW THE MARKS"
                              : "NO HIGH OR MEDIUM FINDINGS");
             string sub = string.Format("{0}  ·  {1}  ·  {2:0} s  ·  last {3} days{4}{5}",
                 report.Computer, report.ReportTime, report.Duration, report.WindowDays,
@@ -1497,7 +1559,7 @@ namespace RansomwareChecker
         void OnMarksChanged()
         {
             if (report == null) return;
-            foreach (var f in report.Findings) Marks.Apply(f);
+            foreach (var f in report.Findings) Marks.Apply(f);   // same key in other rows; the order stays until the next load
             var pos = list.AutoScrollPosition;
             RefreshAll();
             list.AutoScrollPosition = new Point(-pos.X, -pos.Y);
@@ -1515,10 +1577,27 @@ namespace RansomwareChecker
             try
             {
                 if (!Directory.Exists(reportsDir)) return;
-                DirectoryInfo best = null;
+                var found = new List<KeyValuePair<DateTime, string>>();
                 foreach (var d in new DirectoryInfo(reportsDir).GetDirectories())
-                    if (File.Exists(Path.Combine(d.FullName, "findings.json")) && (best == null || d.CreationTime > best.CreationTime)) best = d;
-                if (best != null) { report = Report.Load(best.FullName); reportIsPrevious = true; }
+                {
+                    var json = new FileInfo(Path.Combine(d.FullName, "findings.json"));
+                    if (json.Exists) found.Add(new KeyValuePair<DateTime, string>(json.LastWriteTimeUtc, d.FullName));
+                }
+                string mine = Environment.MachineName + "_";
+                found.Sort((a, b) =>
+                {
+                    bool ma = Path.GetFileName(a.Value).StartsWith(mine, StringComparison.OrdinalIgnoreCase);
+                    bool mb = Path.GetFileName(b.Value).StartsWith(mine, StringComparison.OrdinalIgnoreCase);
+                    return ma != mb ? (ma ? -1 : 1) : b.Key.CompareTo(a.Key);
+                });
+                foreach (var c in found)
+                {
+                    try { report = Report.Load(c.Value); }
+                    catch { continue; }
+                    report.ApplyMarks();
+                    reportIsPrevious = true;
+                    return;
+                }
             }
             catch { report = null; }
         }
@@ -1680,7 +1759,7 @@ namespace RansomwareChecker
                 {
                     running = false;
                     runError = error;
-                    if (loaded != null) { report = loaded; reportIsPrevious = false; }
+                    if (loaded != null) { loaded.ApplyMarks(); report = loaded; reportIsPrevious = false; }
                     RefreshAll();
                     if (loaded != null && !Focused && WindowState == FormWindowState.Minimized) FlashTitle();
                 });
