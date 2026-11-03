@@ -25,7 +25,7 @@ data exfiltration and ransomware deployment.
 Download everything at once:
 
 - **ZIP**: on the repository page click **Code → Download ZIP**, or use
-  [main.zip](https://github.com/dotjuice2/ransomwareChecker/archive/refs/heads/main.zip).
+  [main.zip](https://github.com/d0tju1ce/ransomwareChecker/archive/refs/heads/main.zip).
   Before extracting, unblock the archive (right-click → Properties → **Unblock**), or run:
 
   ```powershell
@@ -35,7 +35,7 @@ Download everything at once:
 - **Git**:
 
   ```powershell
-  git clone https://github.com/dotjuice2/ransomwareChecker.git
+  git clone https://github.com/d0tju1ce/ransomwareChecker.git
   ```
 
 These files must stay together in one folder:
